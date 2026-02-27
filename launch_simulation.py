@@ -257,7 +257,7 @@ Examples:
     else:
         use_webots, scenario, num_drones = run_interactive_menu()
 
-    scenario_id, scenario_desc, script_rel, scenario_cwd = scenario
+    _, scenario_desc, script_rel, scenario_cwd = scenario
     script_path = (
         os.path.join(project_root, script_rel)
         if not os.path.isabs(script_rel)

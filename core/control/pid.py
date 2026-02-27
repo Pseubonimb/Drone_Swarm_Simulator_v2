@@ -96,13 +96,3 @@ class PIDRegulator:
         self.last_error = 0.0
         self.last_time = None
         self._derivative_filtered = 0.0
-
-    def set_integral(self, value: float) -> None:
-        """Set integral term (clamped by integral_limit if > 0)."""
-        if self.integral_limit > 0:
-            self.integral = max(
-                -self.integral_limit,
-                min(self.integral_limit, value),
-            )
-        else:
-            self.integral = value

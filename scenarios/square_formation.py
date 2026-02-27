@@ -257,7 +257,7 @@ def initialize_drone_parallel(
         controller.initialize()
         controller.start_rc_keepalive()
         init_barrier.wait()
-    except Exception as e:
+    except Exception:
         import traceback
         traceback.print_exc()
         raise

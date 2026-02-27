@@ -53,12 +53,6 @@ class DroneController:
             self.logIter = 0
             os.makedirs("logs", exist_ok=True)
             self.logfile = open(f"logs/drone_{self.config['id']}_log.txt", "w")
-        self.roll_position_pid = PIDRegulator(
-            kp=100.0, ki=10.0, kd=0.0, integral_limit=100.0, output_limit=200.0
-        )
-        self.pitch_position_pid = PIDRegulator(
-            kp=100.0, ki=10.0, kd=0.0, integral_limit=100.0, output_limit=200.0
-        )
         self.last_movement_mode = None
         self.last_rc_channels = {
             "roll": RC_NEUTRAL,
@@ -136,57 +130,6 @@ class DroneController:
             if self.logIter % 20 == 0:
                 self.logfile.write(f"{my_position}\n")
         return my_position
-
-    def get_distance_to_drone(
-        self, target_drone_id: int
-    ) -> Optional[float]:
-        """Return distance to another drone by id, or None if position unknown."""
-        if target_drone_id not in self.other_drones_positions:
-            return None
-        return self.coords_monitor.get_distance_to(
-            self.other_drones_positions[target_drone_id]
-        )
-
-    def get_relative_position_to_drone(
-        self, target_drone_id: int
-    ) -> Optional[Dict[str, float]]:
-        """Return relative position to another drone by id, or None if unknown."""
-        if target_drone_id not in self.other_drones_positions:
-            return None
-        return self.coords_monitor.get_relative_position(
-            self.other_drones_positions[target_drone_id]
-        )
-
-    def move_towards(
-        self, target_position: Dict[str, float], kp: float = 500.0
-    ) -> Dict[str, Any]:
-        """Send RC commands to move toward target; return distance and errors."""
-        rel_pos = self.coords_monitor.get_relative_position(target_position)
-        error_x = rel_pos["x"]
-        error_y = rel_pos["y"] - 2
-        intensity_x = min(200, int(abs(error_x) * kp))
-        intensity_y = min(200, int(abs(error_y) * kp))
-        roll = (
-            RC_NEUTRAL + intensity_y
-            if error_y > 0.1
-            else (RC_NEUTRAL - intensity_y if error_y < -0.1 else RC_NEUTRAL)
-        )
-        pitch = (
-            RC_NEUTRAL - intensity_x
-            if error_x > 0.1
-            else (RC_NEUTRAL + intensity_x if error_x < -0.1 else RC_NEUTRAL)
-        )
-        send_rc_override(
-            self.master, roll, pitch, RC_NEUTRAL, RC_NEUTRAL, controller=self
-        )
-        distance = (error_x**2 + error_y**2) ** 0.5
-        return {
-            "roll": roll,
-            "pitch": pitch,
-            "distance": distance,
-            "error_x": error_x,
-            "error_y": error_y,
-        }
 
     def move_towards_with_pid(
         self,
@@ -485,7 +428,7 @@ def initialize_drone_parallel(
         controller.initialize()
         controller.start_rc_keepalive()
         init_barrier.wait()
-    except Exception as e:
+    except Exception:
         import traceback
         traceback.print_exc()
         raise

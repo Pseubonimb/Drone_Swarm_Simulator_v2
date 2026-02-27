@@ -4,9 +4,7 @@ Monitors drone velocity via MAVLink (GLOBAL_POSITION_INT).
 
 import logging
 import threading
-from typing import Any, Dict, Optional, Tuple
-
-from core.mavlink.utils import RC_NEUTRAL
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -72,31 +70,3 @@ class VelocityMonitor:
         """Return current NED velocity (vx, vy, vz) in m/s."""
         with self.lock:
             return self.velocity_ned.copy()
-
-    def get_horizontal_speed(self, direction: Tuple[int, int, int, int]) -> float:
-        """
-        Speed in the given RC direction (roll, pitch, throttle, yaw).
-
-        Positive = motion in that direction. Uses RC_NEUTRAL for comparison.
-
-        Args:
-            direction: (roll, pitch, throttle, yaw) RC channel values.
-
-        Returns:
-            Speed in m/s (signed).
-        """
-        roll, pitch, throttle, yaw = direction
-        with self.lock:
-            vx = self.velocity_ned["vx"]
-            vy = self.velocity_ned["vy"]
-            vz = self.velocity_ned["vz"]
-
-        if pitch > RC_NEUTRAL:
-            return vx
-        if pitch < RC_NEUTRAL:
-            return -vx
-        if roll > RC_NEUTRAL:
-            return vy
-        if roll < RC_NEUTRAL:
-            return -vy
-        return 0.0
