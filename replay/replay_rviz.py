@@ -5,6 +5,7 @@ Replay RViz stub: full ROS/RViz playback in a later stage.
 
 
 def main() -> None:
+    """Entry point: print stub message; full ROS/RViz replay in later stage."""
     print("Replay RViz stub: use ROS/replay in later stage.")
 
 

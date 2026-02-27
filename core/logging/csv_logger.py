@@ -83,15 +83,20 @@ class CSVLogger:
     """
 
     def __init__(self, experiment_dir: str) -> None:
-        """
+        """Initialize logger for an experiment directory.
+
         Args:
             experiment_dir: Directory for CSV files and metadata.json.
         """
         self.experiment_dir = experiment_dir
-        self._files: Dict[int, Any] = {}
+        self._files: Dict[int, TextIO] = {}
 
     def open_drone_log(self, drone_id: int) -> None:
-        """Open drone_<id>.csv with standard header."""
+        """Open drone_<id>.csv with standard header and store handle.
+
+        Args:
+            drone_id: Drone identifier; file will be named drone_<id>.csv.
+        """
         path = os.path.join(self.experiment_dir, f"drone_{drone_id}.csv")
         f = open(path, "w", encoding="utf-8")
         f.write(CSV_HEADER + "\n")
@@ -111,7 +116,17 @@ class CSVLogger:
         rz: float,
         has_collision: int,
     ) -> None:
-        """Append one row for the given drone. File must have been opened via open_drone_log."""
+        """Append one row for the given drone.
+
+        File for this drone must have been opened via open_drone_log.
+
+        Args:
+            drone_id: Drone identifier.
+            t: Time from start (seconds).
+            x, y, z: NED position (m).
+            rx, ry, rz: Euler angles roll, pitch, yaw (radians).
+            has_collision: 0 or 1.
+        """
         if drone_id not in self._files:
             return
         write_row(
@@ -128,7 +143,7 @@ class CSVLogger:
         )
 
     def close_all(self) -> None:
-        """Close all open CSV files."""
+        """Close all open per-drone CSV file handles and clear internal state."""
         for did, f in self._files.items():
             try:
                 f.close()

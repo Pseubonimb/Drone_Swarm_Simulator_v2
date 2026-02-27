@@ -7,7 +7,7 @@ from typing import Any, Optional
 from pymavlink import mavutil
 
 # Neutral PWM value for RC channels (roll, pitch, throttle, yaw).
-RC_NEUTRAL = 1500
+RC_NEUTRAL: int = 1500
 
 
 def send_rc_override(
