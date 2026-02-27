@@ -1,6 +1,10 @@
 """
 Square formation: drones fly a square pattern with PID braking.
 Imports PIDRegulator, VelocityMonitor, send_rc_override from core.
+
+Accepts --drones, --duration, --experiment-dir from launcher for batch compatibility;
+currently uses fixed config (e.g. 5 drones). leader_forward_back is the main scenario
+with full support of these arguments.
 """
 import os
 import sys
@@ -10,9 +14,11 @@ _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
+import argparse
 import threading
 import time
 from datetime import datetime
+from typing import Tuple
 
 from pymavlink import mavutil
 
@@ -34,6 +40,12 @@ class DroneController:
     """Controller for one drone: connection, velocity monitor, PID braking."""
 
     def __init__(self, config: dict, logging_enabled: bool = False) -> None:
+        """Initialize controller with config and optional file logging.
+
+        Args:
+            config: Dict with 'id', 'udp_port', 'role'.
+            logging_enabled: If True, write velocity logs to logs_SQUARE_two_drones/.
+        """
         self.config = config
         self.master = None
         self.velocity_monitor = None
@@ -69,6 +81,7 @@ class DroneController:
         self.rc_channels_lock = threading.Lock()
 
     def connect(self) -> None:
+        """Establish MAVLink connection and create VelocityMonitor."""
         self.master = mavutil.mavlink_connection(
             f'udp:127.0.0.1:{self.config["udp_port"]}'
         )
@@ -76,6 +89,7 @@ class DroneController:
         self.velocity_monitor = VelocityMonitor(self.master)
 
     def initialize(self) -> None:
+        """Arm, take off, switch to ALT_HOLD, start velocity monitor."""
         self.master.set_mode(4)  # GUIDED
         time.sleep(0.5)
         self.master.arducopter_arm()
@@ -100,6 +114,7 @@ class DroneController:
         self.velocity_monitor.start()
 
     def start_rc_keepalive(self) -> None:
+        """Start a daemon thread that periodically sends RC_OVERRIDE to keep commands active."""
         def keepalive_loop() -> None:
             while True:
                 try:
@@ -119,7 +134,7 @@ class DroneController:
 
     def move_with_pid_braking(
         self,
-        direction: tuple,
+        direction: Tuple[int, int, int, int],
         kpx: float = 2000,
         kpy: float = 2000,
         move_duration: float = 5,
@@ -128,6 +143,18 @@ class DroneController:
         velocity_threshold: float = 0.8,
         use_pid: bool = True,
     ) -> None:
+        """Apply direction (roll, pitch, throttle, yaw) then brake to target_velocity with PID.
+
+        Args:
+            direction: (roll, pitch, throttle, yaw) RC values for the move phase.
+            kpx: Proportional gain for pitch braking (when use_pid=False).
+            kpy: Proportional gain for roll braking (when use_pid=False).
+            move_duration: Seconds to apply direction before braking.
+            target_velocity: Target vx/vy for brake phase (typically 0).
+            max_brake_time: Maximum seconds to spend braking.
+            velocity_threshold: Stop braking when |vx| and |vy| are below this.
+            use_pid: If True, use velocity PIDs for braking; else use kpx/kpy.
+        """
         roll, pitch, throttle, yaw = direction
         if self.last_movement_mode != "moving":
             self.roll_velocity_pid.reset()
@@ -203,6 +230,7 @@ class DroneController:
             time.sleep(0.05)
 
     def stop(self) -> None:
+        """Send neutral RC, stop velocity monitor, close log if enabled, command LAND."""
         send_rc_override(
             self.master,
             RC_NEUTRAL,
@@ -225,7 +253,16 @@ def square_pattern(
     use_pid: bool = True,
     velocity_threshold: float = 0.2,
 ) -> None:
-    """Run square pattern with PID braking."""
+    """Run square pattern with PID braking (back, right, forward, left) in a loop.
+
+    Args:
+        controller: Drone controller (connected and initialized).
+        step_duration: Seconds per segment.
+        kpx: Pitch braking gain.
+        kpy: Roll braking gain.
+        use_pid: Use velocity PID for braking.
+        velocity_threshold: Velocity threshold to end brake phase.
+    """
     while True:
         for step in SQUARE_STEPS:
             controller.move_with_pid_braking(
@@ -252,6 +289,7 @@ def square_pattern(
 def initialize_drone_parallel(
     controller: DroneController, init_barrier: threading.Barrier
 ) -> None:
+    """Connect, initialize, start RC keepalive, then wait on barrier (called from worker thread)."""
     try:
         controller.connect()
         controller.initialize()
@@ -264,9 +302,21 @@ def initialize_drone_parallel(
 
 
 def main() -> None:
+    """Parse args (--drones, --duration, --experiment-dir), create controllers, run square pattern.
+
+    Duration and experiment-dir are accepted for batch compatibility; currently
+    uses fixed square pattern loop. Number of drones is taken from --drones.
+    """
+    parser = argparse.ArgumentParser(description="Square formation (square_pid)")
+    parser.add_argument("--drones", type=int, default=5, help="Number of drones (launcher/batch)")
+    parser.add_argument("--duration", type=float, default=0, help="Experiment duration (s); 0 = no limit")
+    parser.add_argument("--experiment-dir", type=str, default=None, help="Experiment log folder")
+    args = parser.parse_args()
+    # Use args.drones for config; duration/experiment-dir reserved for future use
+    num_drones = max(1, args.drones)
     DRONES_CONFIG = [
         {"id": i + 1, "udp_port": 14551 + i * 10, "role": "square"}
-        for i in range(5)
+        for i in range(num_drones)
     ]
     controllers = []
     for config in DRONES_CONFIG:

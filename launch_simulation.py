@@ -22,12 +22,12 @@ import sys
 import time
 from typing import List, Optional, Tuple
 
-project_root = os.path.dirname(os.path.abspath(__file__))
-APM_HOME = os.path.join(project_root, "..", "ardupilot")
-SIM_VEHICLE_PATH = os.path.join(APM_HOME, "Tools", "autotest", "sim_vehicle.py")
+project_root: str = os.path.dirname(os.path.abspath(__file__))
+APM_HOME: str = os.path.join(project_root, "..", "ardupilot")
+SIM_VEHICLE_PATH: str = os.path.join(APM_HOME, "Tools", "autotest", "sim_vehicle.py")
 
 # Scenario id, description, script path relative to project_root, cwd = project_root
-SCENARIOS = [
+SCENARIOS: List[Tuple[str, str, str, str]] = [
     (
         "leader_forward_back",
         "Leader forward-back (leader_forward_back)",
@@ -188,7 +188,8 @@ def run_interactive_menu() -> Tuple[bool, Tuple[str, str, str, str], int]:
     """Interactive menu for mode, scenario, drone count.
 
     Returns:
-        Tuple of (use_webots, scenario_tuple, num_drones).
+        Tuple of (use_webots, scenario_tuple, num_drones). scenario_tuple is
+        (scenario_id, description, script_path, cwd).
     """
     print("\n=== Simulation launcher ===\n")
     print("1. Mode:")
@@ -209,7 +210,11 @@ def run_interactive_menu() -> Tuple[bool, Tuple[str, str, str, str], int]:
 
 
 def main() -> None:
-    """Parse arguments, start SITL (and optionally Webots), then run scenario."""
+    """Parse arguments, start SITL (and optionally Webots), then run scenario.
+
+    If scenario file is missing or SITL cannot be started, exits with code 1.
+    Registers signal handlers for SIGINT/SIGTERM to terminate child processes.
+    """
     parser = argparse.ArgumentParser(
         description="Launcher: SITL + optional Webots + scenario (no 2D visualizer subprocess)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -238,11 +243,11 @@ Examples:
     )
     parser.add_argument(
         "--duration", type=float, default=0, metavar="T",
-        help="Experiment duration (s); 0 = no limit (leader_forward_back)",
+        help="Experiment duration (s); 0 = no limit. Passed to all scenarios; leader_forward_back has full support.",
     )
     parser.add_argument(
         "--experiment-dir", type=str, default=None,
-        help="Experiment log folder (leader_forward_back)",
+        help="Experiment log folder. Passed to all scenarios; leader_forward_back has full support.",
     )
     args = parser.parse_args()
 
@@ -286,15 +291,15 @@ Examples:
     print("[Launcher] Waiting for SITL (arm/takeoff)...")
     time.sleep(8)
 
-    # No 2D matplotlib visualizer subprocess
+    # No 2D matplotlib visualizer subprocess.
+    # Pass --drones, --duration, --experiment-dir to all scenarios; leader_forward_back has full
+    # support; square_formation (square_pid) may ignore these until it accepts them.
     print(f"[Scenario] Starting: {scenario_desc}")
-    scenario_cmd = [sys.executable, script_rel]
-    if "leader_forward_back" in script_rel:
-        scenario_cmd.extend(["--drones", str(num_drones)])
-        if getattr(args, "duration", 0) > 0:
-            scenario_cmd.extend(["--duration", str(args.duration)])
-        if getattr(args, "experiment_dir", None):
-            scenario_cmd.extend(["--experiment-dir", args.experiment_dir])
+    scenario_cmd = [sys.executable, script_rel, "--drones", str(num_drones)]
+    if getattr(args, "duration", 0) > 0:
+        scenario_cmd.extend(["--duration", str(args.duration)])
+    if getattr(args, "experiment_dir", None):
+        scenario_cmd.extend(["--experiment-dir", args.experiment_dir])
     scenario_proc = subprocess.Popen(
         scenario_cmd,
         cwd=scenario_cwd,
