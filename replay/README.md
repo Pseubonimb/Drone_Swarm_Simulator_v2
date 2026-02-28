@@ -59,16 +59,57 @@ python -m replay.replay_rviz --experiment experiments/2025-01-15_10-30-00 --rate
 
 ### Arguments
 
-| Argument       | Required | Description                                                                 |
-|----------------|----------|-----------------------------------------------------------------------------|
-| `--experiment` | Yes      | Path to experiment directory (contains `metadata.json` and `drone_*.csv`).  |
-| `--rate`       | No       | Playback speed multiplier (default: 1.0). 2.0 = 2x, 0.5 = half speed.      |
+| Argument         | Required | Description                                                                 |
+|------------------|----------|-----------------------------------------------------------------------------|
+| `--experiment`   | Yes      | Path to experiment directory (contains `metadata.json` and `drone_*.csv`).  |
+| `--rate`         | No       | Playback speed multiplier (default: 1.0). With `--interactive`, initial speed. |
+| `--interactive`  | No       | Enable play/pause, seek, and speed via keyboard and ROS topics.            |
+
+### Playback controls (play / pause / rewind / speed)
+
+With `--interactive`, playback supports:
+
+- **Keyboard** (when stdin is a TTY): `Space` = play/pause, `a`/`d` (or Left/Right) = step back/forward, `+`/`-` = speed up/down, `q` = quit.
+- **ROS topics** (work in all environments, including Docker where keyboard is unavailable): publish to control playback — see table below.
+
+Without `--interactive`, replay runs once at fixed `--rate` and then exits (original behavior).
 
 ### ROS topics
 
-| Topic                     | Type                  | Description                    |
-|---------------------------|-----------------------|--------------------------------|
-| `/swarm/drone_<id>/pose`  | `geometry_msgs/PoseStamped` | Pose of drone `id` (ENU frame). |
-| `/swarm/metadata`         | `std_msgs/String`     | Experiment metadata JSON (once at start). |
+| Topic                     | Type                       | Description                                      |
+|---------------------------|----------------------------|--------------------------------------------------|
+| `/swarm/drone_<id>/pose`  | `geometry_msgs/PoseStamped`| Pose of drone `id` (ENU frame).                  |
+| `/swarm/metadata`         | `std_msgs/String`          | Experiment metadata JSON (once at start).        |
+| `/replay/play`            | `std_msgs/Empty`           | Start or resume playback (interactive mode).     |
+| `/replay/pause`           | `std_msgs/Empty`           | Pause playback (interactive mode).               |
+| `/replay/seek`            | `std_msgs/Float64`         | Seek to time in seconds (interactive mode).     |
+| `/replay/speed`           | `std_msgs/Float32`         | Set speed multiplier, e.g. 0.25–4.0 (interactive mode). |
 
 Poses are published in ENU for RViz (converted from NED in the CSV). Use Ctrl+C to stop replay cleanly (SIGINT handled).
+
+### Docker launch
+
+From project root, use the helper script (see also `docs/replay-setup.md`):
+
+```bash
+./scripts/replay-docker.sh EXPERIMENT_PATH [RATE] [INTERACTIVE]
+```
+
+- **EXPERIMENT_PATH** — path to experiment dir (e.g. `experiments/2025-01-15_10-30-00`).
+- **RATE** — optional playback speed 0.25–4.0 (default 1.0).
+- **INTERACTIVE** — optional: `1`, `true`, or `yes` to enable play/pause/rewind/speed controls. In Docker the keyboard is unavailable; use ROS topics `/replay/play`, `/replay/pause`, `/replay/seek`, `/replay/speed` from another node or host.
+
+Example:
+
+```bash
+export DISPLAY=:0
+xhost +local:docker
+
+# Linear playback (default rate 1.0)
+./scripts/replay-docker.sh experiments/2025-01-15_10-30-00 1.0
+
+# Interactive: control via ROS topics (keyboard does not work inside Docker)
+./scripts/replay-docker.sh experiments/2025-01-15_10-30-00 1.0 1
+```
+
+This starts one container with roscore + replay. Run RViz separately (e.g. second terminal or container) with `rosrun rviz rviz`. Workspace path is configurable via `PROJECT_ROOT` (default: directory above `scripts/`).

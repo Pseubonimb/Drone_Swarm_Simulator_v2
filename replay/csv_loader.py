@@ -6,7 +6,7 @@ Replay module is isolated: reads only CSV and metadata, does not import from cor
 
 import json
 import os
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any, Dict, Generator, List, Optional, Set, Tuple
 
 # --- T1: Validation constants ---
 REQUIRED_METADATA_KEYS = ("duration_sec", "collision_radius_m", "num_drones", "scenario")
@@ -144,7 +144,7 @@ def iter_steps(
     experiment_dir: Optional[str] = None,
     loaded: Optional[Dict[str, Any]] = None,
     align: str = "t",
-) -> Generator[tuple[float, List[Optional[Dict[str, Any]]]], None, None]:
+) -> Generator[Tuple[float, List[Optional[Dict[str, Any]]]], None, None]:
     """Step-wise iteration over experiment data.
 
     For each time step yields (t, list_of_drone_dicts). Each dict has keys
@@ -186,7 +186,7 @@ def iter_steps(
     if align != "t":
         raise ValueError("align must be 't' or 'shortest'")
     # Collect all unique t, sorted
-    all_t: set[float] = set()
+    all_t: Set[float] = set()
     for rows in rows_by_drone:
         for row in rows:
             all_t.add(row["t"])
@@ -227,6 +227,6 @@ class ReplaySteps:
 
     def __iter__(
         self,
-    ) -> Generator[tuple[float, List[Optional[Dict[str, Any]]]], None, None]:
+    ) -> Generator[Tuple[float, List[Optional[Dict[str, Any]]]], None, None]:
         """Yield (t, list of per-drone dicts) for each time step."""
         return iter_steps(loaded=self._loaded, align=self._align)
