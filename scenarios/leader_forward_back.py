@@ -28,6 +28,11 @@ from core.mavlink.utils import (
 from core.monitors.coords_monitor import CoordsMonitor
 from core.monitors.velocity_monitor import VelocityMonitor
 
+try:
+    from visualizer.position_publisher import publish_positions as _publish_positions
+except ImportError:
+    _publish_positions = None
+
 RATES_SHARED = {"follower_hz": None, "exchange_hz": None, "webots_step_hz": None}
 WEBOTS_LAST_TS = {}
 FOLLOWER_HZ_HISTORY = []
@@ -42,6 +47,12 @@ class DroneController:
     """Controller for one drone: connection, monitors, PIDs, RC keepalive."""
 
     def __init__(self, config: dict, logging_enabled: bool = False) -> None:
+        """Initialize controller with config and optional file logging.
+
+        Args:
+            config: Dict with 'id', 'udp_port', 'role'.
+            logging_enabled: If True, write position logs to logs/drone_<id>_log.txt.
+        """
         self.config = config
         self.master = None
         self.coords_monitor = None
@@ -194,7 +205,13 @@ def leader_pattern(
     forward_duration: float = 10,
     experiment_duration: float = 0,
 ) -> None:
-    """Leader: forward → stop → backward → stop. pitch 1400=forward, 1600=backward."""
+    """Leader: forward → stop → backward → stop. pitch 1400=forward, 1600=backward.
+
+    Args:
+        controller: Leader drone controller (MAVLink connected).
+        forward_duration: Seconds to fly forward and again backward before stopping.
+        experiment_duration: If > 0, stop when global experiment time exceeds this (s).
+    """
     global START_TIME
     start = time.time()
     while time.time() - start < forward_duration:
@@ -251,7 +268,18 @@ def follower_loop(
     log_run_id: Optional[str] = None,
     experiment_duration: float = 0,
 ) -> None:
-    """Run follower control loop: track leader position with PID and log to CSV."""
+    """Run follower control loop: track leader position with PID and log to CSV.
+
+    Args:
+        controller: Follower drone controller.
+        target_drone_id: Leader drone id to follow (used as key in other_drones_positions).
+        kp: Proportional gain for roll/pitch PID.
+        ki: Integral gain.
+        kd: Derivative gain.
+        control_loop_period_sec: If set, sleep this long between iterations.
+        log_run_id: Optional suffix for log filename (logs/two_drones_log_<suffix>.csv).
+        experiment_duration: If > 0, exit when global experiment time exceeds this (s).
+    """
     global START_TIME, FOLLOWER_HZ_HISTORY, RATES_SHARED
     roll_pid = PIDRegulator(
         kp=kp, ki=ki, kd=kd, integral_limit=100.0, output_limit=200.0
@@ -360,7 +388,14 @@ def coordinate_exchange_loop(
     duration: float = 0,
     collision_radius: float = 0.2,
 ) -> None:
-    """Exchange positions between drones, compute collisions, write CSV rows until duration."""
+    """Exchange positions between drones, compute collisions, write CSV rows until duration.
+
+    Args:
+        controllers: List of drone controllers (each has get_my_position, update_other_drone_position).
+        experiment_log_files: Optional dict drone_id -> file handle for CSV rows (t,x,y,z,rx,ry,rz,hasCollision).
+        duration: If > 0, stop when time since START_TIME exceeds this (s).
+        collision_radius: Sphere radius for collision detection (m); collision if distance < 2*radius.
+    """
     global EXCHANGE_HZ_HISTORY, START_TIME
     try:
         while True:
@@ -388,6 +423,11 @@ def coordinate_exchange_loop(
             RATES_SHARED["webots_step_hz"] = _read_webots_step_hz(
                 num_instances=len(controllers)
             )
+            if _publish_positions is not None:
+                try:
+                    _publish_positions(positions, rates=RATES_SHARED)
+                except Exception:
+                    pass
             if experiment_log_files:
                 t = time.time() - START_TIME
                 collision_flags = _compute_collision_flags(

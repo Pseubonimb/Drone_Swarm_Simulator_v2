@@ -216,7 +216,7 @@ def main() -> None:
     Registers signal handlers for SIGINT/SIGTERM to terminate child processes.
     """
     parser = argparse.ArgumentParser(
-        description="Launcher: SITL + optional Webots + scenario (no 2D visualizer subprocess)",
+        description="Launcher: SITL + optional Webots + scenario; use --with-2d-visualizer for live 2D plot",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -248,6 +248,11 @@ Examples:
     parser.add_argument(
         "--experiment-dir", type=str, default=None,
         help="Experiment log folder. Passed to all scenarios; leader_forward_back has full support.",
+    )
+    parser.add_argument(
+        "--with-2d-visualizer",
+        action="store_true",
+        help="Start 2D matplotlib visualizer subprocess before the scenario.",
     )
     args = parser.parse_args()
 
@@ -291,9 +296,20 @@ Examples:
     print("[Launcher] Waiting for SITL (arm/takeoff)...")
     time.sleep(8)
 
-    # No 2D matplotlib visualizer subprocess.
-    # Pass --drones, --duration, --experiment-dir to all scenarios; leader_forward_back has full
-    # support; square_formation (square_pid) may ignore these until it accepts them.
+    if getattr(args, "with_2d_visualizer", False):
+        visualizer_script = os.path.join(project_root, "visualizer", "drone_position_visualizer.py")
+        if os.path.isfile(visualizer_script):
+            visualizer_proc = subprocess.Popen(
+                [sys.executable, "visualizer/drone_position_visualizer.py"],
+                cwd=project_root,
+                stdout=sys.stdout,
+                stderr=sys.stderr,
+            )
+            processes.append(visualizer_proc)
+            print("[Launcher] Started 2D visualizer subprocess.")
+        else:
+            print(f"[Launcher] 2D visualizer script not found: {visualizer_script}")
+
     print(f"[Scenario] Starting: {scenario_desc}")
     scenario_cmd = [sys.executable, script_rel, "--drones", str(num_drones)]
     if getattr(args, "duration", 0) > 0:
