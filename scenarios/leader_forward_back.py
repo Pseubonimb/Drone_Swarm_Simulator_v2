@@ -387,16 +387,24 @@ def coordinate_exchange_loop(
     experiment_log_files: Optional[Dict[int, Any]] = None,
     duration: float = 0,
     collision_radius: float = 0.2,
+    log_hz: float = 0.0,
 ) -> None:
     """Exchange positions between drones, compute collisions, write CSV rows until duration.
+
+    CSV is written only when position or attitude has changed (sync with SITL update rate).
+    Optionally log_hz caps the write rate (e.g. match SITL LOCAL_POSITION_NED rate).
 
     Args:
         controllers: List of drone controllers (each has get_my_position, update_other_drone_position).
         experiment_log_files: Optional dict drone_id -> file handle for CSV rows (t,x,y,z,rx,ry,rz,hasCollision).
         duration: If > 0, stop when time since START_TIME exceeds this (s).
         collision_radius: Sphere radius for collision detection (m); collision if distance < 2*radius.
+        log_hz: Max CSV write rate (Hz); 0 = write only when position/attitude changed (full sync with SITL).
     """
     global EXCHANGE_HZ_HISTORY, START_TIME
+    last_written: Dict[int, tuple] = {}  # drone_id -> (x, y, z, rx, ry, rz)
+    last_csv_log_time = 0.0
+    log_period = (1.0 / log_hz) if log_hz > 0 else 0.0
     try:
         while True:
             if duration > 0 and (time.time() - START_TIME) >= duration:
@@ -429,27 +437,40 @@ def coordinate_exchange_loop(
                 except Exception:
                     pass
             if experiment_log_files:
-                t = time.time() - START_TIME
+                now = time.time()
+                t = now - START_TIME
+                rate_ok = log_period <= 0 or (now - last_csv_log_time) >= log_period
                 collision_flags = _compute_collision_flags(
                     positions, collision_radius
                 )
+                wrote_this_iter = False
                 for controller in controllers:
                     did = controller.config["id"]
                     pos = positions[did]
                     att = attitudes[did]
-                    hc = 1 if collision_flags[did] else 0
-                    write_row(
-                        experiment_log_files[did],
-                        did,
-                        t,
-                        pos["x"],
-                        pos["y"],
-                        pos["z"],
-                        att["rx"],
-                        att["ry"],
-                        att["rz"],
-                        hc,
+                    state = (
+                        pos["x"], pos["y"], pos["z"],
+                        att["rx"], att["ry"], att["rz"],
                     )
+                    changed = last_written.get(did) != state
+                    if changed and rate_ok:
+                        last_written[did] = state
+                        hc = 1 if collision_flags[did] else 0
+                        write_row(
+                            experiment_log_files[did],
+                            did,
+                            t,
+                            pos["x"],
+                            pos["y"],
+                            pos["z"],
+                            att["rx"],
+                            att["ry"],
+                            att["rz"],
+                            hc,
+                        )
+                        wrote_this_iter = True
+                if wrote_this_iter:
+                    last_csv_log_time = now
     finally:
         if experiment_log_files:
             for did, f in experiment_log_files.items():
@@ -521,6 +542,12 @@ def main() -> None:
         default=0.2,
         help="Drone sphere radius for collision detection (m)",
     )
+    parser.add_argument(
+        "--log-hz",
+        type=float,
+        default=0.0,
+        help="Max CSV log write rate (Hz); 0 = write only when position/attitude changed (sync with SITL)",
+    )
     args = parser.parse_args()
     args.control_loop_period_sec = (
         1.0 / args.control_hz if args.control_hz and args.control_hz > 0 else None
@@ -586,6 +613,7 @@ def main() -> None:
             "experiment_log_files": experiment_log_files,
             "duration": args.duration,
             "collision_radius": args.collision_radius,
+            "log_hz": getattr(args, "log_hz", 0.0),
         },
         daemon=True,
     ).start()

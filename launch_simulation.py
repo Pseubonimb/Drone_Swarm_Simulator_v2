@@ -3,13 +3,16 @@
 Launcher for Drone Swarm Simulator v2: SITL + optional Webots + scenario.
 
 Usage:
-  python launch_simulation.py                    # interactive menu
+  python launch_simulation.py                    # interactive menu (SITL, scenario, 2D visualizer)
   python launch_simulation.py --help
   python launch_simulation.py -s -c leader_forward_back   # SITL-only, no 2D visualizer
+  python launch_simulation.py -s -c leader_forward_back --with-2d-visualizer   # SITL + 2D visualizer
 
 Simulation modes:
   --webots, -w      Webots 3D + SITL
   --sitl-only, -s   SITL only (default)
+
+In interactive mode you can choose to start the 2D matplotlib visualizer (UDP port 15551).
 
 Scenarios run from project root so they can import core.
 """
@@ -184,12 +187,12 @@ def launch_webots(
     return subprocess.Popen(["webots", OUTPUT_WORLD], env=env)
 
 
-def run_interactive_menu() -> Tuple[bool, Tuple[str, str, str, str], int]:
-    """Interactive menu for mode, scenario, drone count.
+def run_interactive_menu() -> Tuple[bool, Tuple[str, str, str, str], int, bool]:
+    """Interactive menu for mode, scenario, drone count, and 2D visualizer.
 
     Returns:
-        Tuple of (use_webots, scenario_tuple, num_drones). scenario_tuple is
-        (scenario_id, description, script_path, cwd).
+        Tuple of (use_webots, scenario_tuple, num_drones, use_2d_visualizer).
+        scenario_tuple is (scenario_id, description, script_path, cwd).
     """
     print("\n=== Simulation launcher ===\n")
     print("1. Mode:")
@@ -206,7 +209,10 @@ def run_interactive_menu() -> Tuple[bool, Tuple[str, str, str, str], int]:
     print("\n3. Number of drones:")
     d = input("   Count [default 2]: ").strip()
     num_drones = int(d) if d.isdigit() and int(d) >= 1 else 2
-    return use_webots, scenario, num_drones
+    print("\n4. 2D visualization (matplotlib, UDP port 15551):")
+    v = input("   Start 2D visualizer? [y/N, default: y]: ").strip().lower() or "y"
+    use_2d_visualizer = v in ("y", "yes", "1")
+    return use_webots, scenario, num_drones, use_2d_visualizer
 
 
 def main() -> None:
@@ -235,10 +241,11 @@ Examples:
     parser.add_argument(
         "--param-file",
         type=str,
-        default=None,
+        default="config/iris.parm",
         help=(
-            "Optional ArduPilot parameter file (e.g. config/iris.parm). "
-            "If not provided or file missing, SITL runs with defaults."
+            "ArduPilot parameter file (default: config/iris.parm). "
+            "Used for SITL in all modes (SITL-only, Webots, interactive). "
+            "If file is missing, SITL runs with defaults."
         ),
     )
     parser.add_argument(
@@ -264,8 +271,9 @@ Examples:
             if args.scenario
             else SCENARIOS[0]
         )
+        use_2d_visualizer = getattr(args, "with_2d_visualizer", False)
     else:
-        use_webots, scenario, num_drones = run_interactive_menu()
+        use_webots, scenario, num_drones, use_2d_visualizer = run_interactive_menu()
 
     _, scenario_desc, script_rel, scenario_cwd = scenario
     script_path = (
@@ -296,7 +304,7 @@ Examples:
     print("[Launcher] Waiting for SITL (arm/takeoff)...")
     time.sleep(8)
 
-    if getattr(args, "with_2d_visualizer", False):
+    if use_2d_visualizer:
         visualizer_script = os.path.join(project_root, "visualizer", "drone_position_visualizer.py")
         if os.path.isfile(visualizer_script):
             visualizer_proc = subprocess.Popen(
