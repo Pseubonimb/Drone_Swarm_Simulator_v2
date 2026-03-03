@@ -1,22 +1,20 @@
 """
 Leader forward-back: leader flies forward → stop → backward → stop.
+
 All drones in POS_HOLD; CoordsMonitor and VelocityMonitor from core; PID from core.
 """
+import logging
 import os
 import sys
-
-# Ensure project root is on path when run as script (e.g. python scenarios/leader_forward_back.py)
-_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _project_root not in sys.path:
-    sys.path.insert(0, _project_root)
-
-import logging
 import threading
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger(__name__)
+# Ensure project root is on path when run as script (e.g. python scenarios/leader_forward_back.py)
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
 
 from core.control import DroneController, PIDRegulator
 from core.logging.csv_logger import CSV_HEADER, write_metadata, write_row
@@ -26,6 +24,8 @@ try:
     from visualizer.position_publisher import publish_positions as _publish_positions
 except ImportError:
     _publish_positions = None
+
+logger = logging.getLogger(__name__)
 
 RATES_SHARED = {"follower_hz": None, "exchange_hz": None, "webots_step_hz": None}
 WEBOTS_LAST_TS = {}
@@ -65,23 +65,31 @@ def move_towards_with_pid(
     pitch_pid: Optional[PIDRegulator] = None,
     dt: Optional[float] = None,
     distance_threshold: float = 0.4,
+    my_position_common: Optional[Dict[str, float]] = None,
 ) -> None:
     """Move controller toward target using optional PIDs; send neutral if within threshold.
 
     Args:
         controller: Drone controller with coords_monitor and worker.
-        target_position: Target NED position dict with 'x', 'y', 'z'.
+        target_position: Target NED position dict with 'x', 'y', 'z' (common frame).
         roll_pid: Optional PID for lateral (y) error.
         pitch_pid: Optional PID for longitudinal (x) error.
         dt: Optional time step for PID update (seconds).
         distance_threshold: Distance below which to send neutral and reset PIDs (meters).
-
-    Returns:
-        None. Sends RC_OVERRIDE via controller.worker.
+        my_position_common: If set, use this as current position in common frame for
+            relative position (e.g. from SITL per-drone home: y + (id-1)*2). Omit to use
+            coords_monitor (drone's own NED).
     """
     if controller.coords_monitor is None or controller.worker is None:
         return
-    rel_pos = controller.coords_monitor.get_relative_position(target_position)
+    if my_position_common is not None:
+        rel_pos = {
+            "x": target_position["x"] - my_position_common["x"],
+            "y": target_position["y"] - my_position_common["y"],
+            "z": target_position["z"] - my_position_common["z"],
+        }
+    else:
+        rel_pos = controller.coords_monitor.get_relative_position(target_position)
     error_x = rel_pos["x"]
     error_y = rel_pos["y"] - 2
     distance = (error_x**2 + error_y**2) ** 0.5
@@ -199,7 +207,8 @@ def follower_loop(
     log_filename = f"logs/two_drones_log{suffix}.csv"
     log_file = open(log_filename, "w")
     log_file.write(
-        "t,leader_x,leader_y,follower_x,follower_y,error_x,error_y,follower_vx,follower_vy,loop_dt\n"
+        "t,leader_x,leader_y,follower_x,follower_y,error_x,error_y,"
+        "follower_vx,follower_vy,loop_dt\n"
     )
     log_file.flush()
     last_iter_time = None
@@ -220,8 +229,18 @@ def follower_loop(
                     FOLLOWER_HZ_HISTORY = FOLLOWER_HZ_HISTORY[-FOLLOWER_HZ_WINDOW:]
                 RATES_SHARED["follower_hz"] = sum(FOLLOWER_HZ_HISTORY) / len(FOLLOWER_HZ_HISTORY)
             leader_pos = other_positions[target_drone_id]
-            follower_pos = controller.get_my_position()
-            rel_pos = controller.coords_monitor.get_relative_position(leader_pos)
+            raw_pos = controller.get_my_position()
+            # Follower position in common NED frame (SITL per-drone home: Y offset (id-1)*2).
+            did = controller.config["id"]
+            follower_pos_common = {
+                **raw_pos,
+                "y": raw_pos["y"] + (did - 1) * 2.0,
+            }
+            rel_pos = {
+                "x": leader_pos["x"] - follower_pos_common["x"],
+                "y": leader_pos["y"] - follower_pos_common["y"],
+                "z": leader_pos["z"] - follower_pos_common["z"],
+            }
             error_x = rel_pos["x"]
             error_y = rel_pos["y"] - 2.0
             vel = controller.velocity_monitor.get_velocity()
@@ -229,7 +248,7 @@ def follower_loop(
             t = now - START_TIME
             log_file.write(
                 f"{t:.3f},{leader_pos['x']:.3f},{leader_pos['y']:.3f},"
-                f"{follower_pos['x']:.3f},{follower_pos['y']:.3f},"
+                f"{follower_pos_common['x']:.3f},{follower_pos_common['y']:.3f},"
                 f"{error_x:.3f},{error_y:.3f},{vx:.3f},{vy:.3f},{loop_dt:.4f}\n"
             )
             log_file.flush()
@@ -239,7 +258,12 @@ def follower_loop(
                 else None
             )
             move_towards_with_pid(
-                controller, leader_pos, roll_pid, pitch_pid, dt=dt_loop
+                controller,
+                leader_pos,
+                roll_pid,
+                pitch_pid,
+                dt=dt_loop,
+                my_position_common=follower_pos_common,
             )
             if dt_loop is not None:
                 time.sleep(dt_loop)
@@ -306,12 +330,12 @@ def coordinate_exchange_loop(
     Reported exchange_hz is the actual loop rate (full period including sleep), not just body time.
 
     Args:
-        controllers: List of drone controllers (each has get_my_position, update_other_drone_position).
-        experiment_log_files: Optional dict drone_id -> file handle for CSV rows (t,x,y,z,rx,ry,rz,hasCollision).
+        controllers: List of drone controllers (get_my_position, update_other_drone_position).
+        experiment_log_files: Optional dict drone_id -> file handle for CSV rows.
         duration: If > 0, stop when time since START_TIME exceeds this (s).
-        collision_radius: Sphere radius for collision detection (m); collision if distance < 2*radius.
-        log_hz: Max CSV write rate (Hz); 0 = write only when position/attitude changed (full sync with SITL).
-        exchange_loop_hz: Main loop rate (Hz); 0 = no limit. Use 50 to match SITL LOCAL_POSITION_NED rate.
+        collision_radius: Sphere radius for collision detection (m); collision if d < 2*radius.
+        log_hz: Max CSV write rate (Hz); 0 = write when position/attitude changed (sync SITL).
+        exchange_loop_hz: Main loop rate (Hz); 0 = no limit. Use 50 to match SITL rate.
     """
     global EXCHANGE_HZ_HISTORY, START_TIME
     last_written: Dict[int, tuple] = {}  # drone_id -> (x, y, z, rx, ry, rz)
@@ -327,7 +351,13 @@ def coordinate_exchange_loop(
             attitudes = {}
             for controller in controllers:
                 did = controller.config["id"]
-                positions[did] = controller.get_my_position()
+                pos_raw = controller.get_my_position()
+                # Convert to common NED frame: each SITL has its own home (Y offset 0, 2, 4, ... m).
+                # Add (did-1)*2 to y so positions align with SITL per-drone home spacing.
+                positions[did] = {
+                    **pos_raw,
+                    "y": pos_raw["y"] + (did - 1) * 2.0,
+                }
                 attitudes[did] = controller.coords_monitor.get_attitude()
             for controller in controllers:
                 for drone_id, position in positions.items():
@@ -351,13 +381,10 @@ def coordinate_exchange_loop(
                 wrote_this_iter = False
                 for controller in controllers:
                     did = controller.config["id"]
-                    pos = positions[did]
+                    pos = positions[did]  # already in common frame (y includes (did-1)*2)
                     att = attitudes[did]
-                    # Initial row: enforce Y=(k-1)*2 so 2D viz and replay show correct spacing
-                    is_first_row = did not in last_written
-                    y_val = (did - 1) * 2.0 if is_first_row else pos["y"]
                     state = (
-                        pos["x"], y_val, pos["z"],
+                        pos["x"], pos["y"], pos["z"],
                         att["rx"], att["ry"], att["rz"],
                     )
                     changed = last_written.get(did) != state
@@ -369,7 +396,7 @@ def coordinate_exchange_loop(
                             did,
                             t,
                             pos["x"],
-                            y_val,
+                            pos["y"],
                             pos["z"],
                             att["rx"],
                             att["ry"],
@@ -467,13 +494,19 @@ def main() -> None:
         "--log-hz",
         type=float,
         default=0.0,
-        help="Max CSV log write rate (Hz); 0 = write only when position/attitude changed (sync with SITL)",
+        help=(
+            "Max CSV log write rate (Hz); 0 = write when position/attitude changed "
+            "(sync with SITL)"
+        ),
     )
     parser.add_argument(
         "--exchange-hz",
         type=float,
         default=50.0,
-        help="Coordinate exchange loop rate (Hz); match SITL position stream (default 50). 0 = no limit.",
+        help=(
+            "Coordinate exchange loop rate (Hz); match SITL position stream "
+            "(default 50). 0 = no limit."
+        ),
     )
     args = parser.parse_args()
     args.control_loop_period_sec = (

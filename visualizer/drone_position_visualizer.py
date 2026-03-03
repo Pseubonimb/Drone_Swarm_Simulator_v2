@@ -61,20 +61,18 @@ def parse_args() -> argparse.Namespace:
         help="Number of last points to show as trail (0 = current only)",
     )
     parser.add_argument(
-        "--interval", type=float, default=0.1,
-        help="Plot update interval in seconds",
+        "--interval", type=float, default=0.02,
+        help="Plot update interval in seconds (default 0.02 = 50 Hz; match --exchange-hz for smooth display)",
     )
     return parser.parse_args()
 
 
 class PositionReceiver:
-    """Listens on UDP and accumulates drone positions and loop rates.
+    """Listens on UDP and stores current drone positions and loop rates (no history).
 
     Thread-safe: receive loop runs in a daemon thread; get_positions/get_rates
-    return copies under lock.
+    return copies under lock. No unbounded history to avoid heavy redraws and jitter.
     """
-
-    MAX_HISTORY = 500
 
     def __init__(self, port: int) -> None:
         """Bind to the given UDP port (socket created in start()).
@@ -84,7 +82,6 @@ class PositionReceiver:
         """
         self.port = port
         self.positions: Dict[Any, Dict[str, float]] = {}
-        self.history: Dict[Any, List[Tuple[float, float, float]]] = {}
         self.rates: Dict[str, Optional[float]] = {}
         self.lock = threading.Lock()
         self.running = False
@@ -124,12 +121,6 @@ class PositionReceiver:
                         y = float(p.get("y", 0))
                         z = float(p.get("z", 0))
                         self.positions[drone_id] = {"x": x, "y": y, "z": z}
-                        if drone_id not in self.history:
-                            self.history[drone_id] = []
-                        h = self.history[drone_id]
-                        h.append((x, y, z))
-                        if len(h) > self.MAX_HISTORY:
-                            self.history[drone_id] = h[-self.MAX_HISTORY:]
                     if rates_dict is not None:
                         self.rates = {
                             "follower_hz": rates_dict.get("follower_hz"),
@@ -151,14 +142,13 @@ class PositionReceiver:
     def get_positions(
         self,
     ) -> Tuple[Dict[Any, Dict[str, float]], Dict[Any, List[Tuple[float, float, float]]]]:
-        """Return copy of positions and history (thread-safe).
+        """Return copy of current positions only (thread-safe). No history.
 
         Returns:
-            Tuple of (positions dict, history dict). Positions: drone_id -> {x,y,z};
-            history: drone_id -> list of (x,y,z) tuples.
+            Tuple of (positions dict, empty history). Positions: drone_id -> {x,y,z}.
         """
         with self.lock:
-            return self.positions.copy(), {k: list(v) for k, v in self.history.items()}
+            return self.positions.copy(), {}
 
     def get_rates(self) -> Dict[str, Optional[float]]:
         """Return copy of rates (thread-safe).
@@ -232,7 +222,7 @@ def run_visualizer(port: int, trail: int, interval: float) -> None:
         return list(lines.values()) + list(points.values())
 
     def animate(_: Any) -> List[Any]:
-        pos, hist = receiver.get_positions()
+        pos, _ = receiver.get_positions()
         rates = receiver.get_rates()
         vals = [
             rates.get("follower_hz"),
@@ -245,12 +235,13 @@ def run_visualizer(port: int, trail: int, interval: float) -> None:
             f"follower_loop: {_format_hz(rates.get('follower_hz'))} Hz  |  "
             f"exchange_loop: {_format_hz(rates.get('exchange_hz'))} Hz  |  "
             f"Webots step: {_format_hz(rates.get('webots_step_hz'))} Hz  |  "
-            f"Min loop: {_format_hz(min_hz)} Hz  |  Drones: {len(hist)}"
+            f"Min loop: {_format_hz(min_hz)} Hz  |  Drones: {len(pos)}"
         )
         rates_text.set_text(rates_str)
 
-        trail_n = max(0, trail)
-        for drone_id, pts in list(hist.items()):
+        # Current positions only (no history) — one point per drone
+        all_x, all_y = [], []
+        for drone_id, p in list(pos.items()):
             if drone_id not in lines:
                 col = color_for_drone(drone_id)
                 lbl = label_for_drone(drone_id)
@@ -258,29 +249,16 @@ def run_visualizer(port: int, trail: int, interval: float) -> None:
                     [], [], "-", color=col, linewidth=1.5, alpha=0.6, label=lbl
                 )
                 points[drone_id], = ax.plot([], [], "o", color=col, markersize=10)
-
-            if trail_n > 0 and len(pts) > trail_n:
-                pts = pts[-trail_n:]
-            elif trail_n == 0 and pts:
-                pts = pts[-1:]
-
-            if pts:
-                xs = [p[0] for p in pts]
-                ys = [p[1] for p in pts]
-                lines[drone_id].set_data(xs, ys)
-                points[drone_id].set_data([xs[-1]], [ys[-1]])
+            x, y = p.get("x", 0), p.get("y", 0)
+            lines[drone_id].set_data([x], [y])
+            points[drone_id].set_data([x], [y])
+            all_x.append(x)
+            all_y.append(y)
 
         if lines:
             handles = [lines[did] for did in sorted(lines.keys())]
             labels = [label_for_drone(did) for did in sorted(lines.keys())]
             ax.legend(handles, labels, loc="upper left", fontsize=9)
-
-        all_x, all_y = [], []
-        for pts in hist.values():
-            if pts:
-                trail_pts = pts[-trail_n:] if trail_n > 0 else pts[-1:]
-                all_x.extend(p[0] for p in trail_pts)
-                all_y.extend(p[1] for p in trail_pts)
         if all_x and all_y:
             margin = 2.0
             x_min, x_max = min(all_x) - margin, max(all_x) + margin

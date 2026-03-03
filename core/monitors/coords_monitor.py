@@ -1,106 +1,57 @@
 """
-Monitors drone position (LOCAL_POSITION_NED) and attitude (ATTITUDE) via MAVLink.
+Monitors drone position (LOCAL_POSITION_NED) and attitude (ATTITUDE) via MAVLinkWorker.
+
+No dedicated threads: reads from the worker's thread-safe state cache.
+One MAVLink connection is used only by the worker's single thread.
 """
 
 import logging
-import threading
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
-from pymavlink import mavutil
+from core.mavlink.worker import MAVLinkWorker
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_POSITION: Dict[str, float] = {"x": 0.0, "y": 0.0, "z": 0.0}
+_DEFAULT_ATTITUDE: Dict[str, float] = {"rx": 0.0, "ry": 0.0, "rz": 0.0}
 
 
 class CoordsMonitor:
     """
-    Monitors NED position and Euler attitude from a single drone MAVLink connection.
+    Reads NED position and Euler attitude from a MAVLinkWorker (thread-safe cache).
 
-    Uses dedicated threads for LOCAL_POSITION_NED and ATTITUDE. No MAVLinkWorker
-    integration in Stage 2; takes drone connection directly.
+    Does not own any MAVLink connection or threads. All pymavlink I/O is done
+    in the worker's single thread.
     """
 
-    def __init__(self, drone: Any) -> None:
+    def __init__(self, worker: MAVLinkWorker) -> None:
         """
         Args:
-            drone: MAVLink connection (mavutil.mavlink_connection).
+            worker: MAVLinkWorker instance for this drone (get_position, get_attitude).
         """
-        self.drone = drone
-        self.position_ned: Dict[str, float] = {"x": 0.0, "y": 0.0, "z": 0.0}
-        self.attitude: Dict[str, float] = {
-            "rx": 0.0,
-            "ry": 0.0,
-            "rz": 0.0,
-        }  # roll, pitch, yaw (radians)
-        self.running = False
-        self.thread: Optional[threading.Thread] = None
-        self.attitude_thread: Optional[threading.Thread] = None
-        self.lock = threading.Lock()
+        self._worker = worker
 
     def start(self) -> None:
-        """Start position and attitude monitoring in separate threads."""
-        if self.running:
-            return
-        self.running = True
-        self.thread = threading.Thread(target=self._monitor_loop, daemon=True)
-        self.thread.start()
-        self.attitude_thread = threading.Thread(
-            target=self._attitude_loop, daemon=True
-        )
-        self.attitude_thread.start()
-        logger.info("Coordinates and attitude monitoring started")
+        """No-op: worker thread is already running. Kept for API compatibility."""
+        pass
 
     def stop(self) -> None:
-        """Stop monitoring threads."""
-        self.running = False
-        if self.thread:
-            self.thread.join(timeout=1.0)
-        if self.attitude_thread:
-            self.attitude_thread.join(timeout=1.0)
-        logger.info("Coordinates monitoring stopped")
-
-    def _monitor_loop(self) -> None:
-        """Loop reading LOCAL_POSITION_NED (blocking)."""
-        while self.running:
-            try:
-                msg = self.drone.recv_match(
-                    type="LOCAL_POSITION_NED", blocking=True
-                )
-                if not msg:
-                    continue
-                if msg.get_type() == "BAD_DATA":
-                    if mavutil.all_printable(msg.data):
-                        logger.debug("BAD_DATA: %s", msg.data)
-                    continue
-                with self.lock:
-                    self.position_ned["x"] = msg.x
-                    self.position_ned["y"] = msg.y
-                    self.position_ned["z"] = msg.z
-            except Exception:
-                pass
-
-    def _attitude_loop(self) -> None:
-        """Loop reading ATTITUDE (roll, pitch, yaw in radians)."""
-        while self.running:
-            try:
-                msg = self.drone.recv_match(type="ATTITUDE", blocking=True)
-                if not msg or msg.get_type() == "BAD_DATA":
-                    continue
-                with self.lock:
-                    self.attitude["rx"] = msg.roll
-                    self.attitude["ry"] = msg.pitch
-                    self.attitude["rz"] = msg.yaw
-            except Exception:
-                pass
-
-    def get_attitude(self) -> Dict[str, float]:
-        """Return current Euler angles (roll, pitch, yaw) in radians."""
-        with self.lock:
-            return self.attitude.copy()
+        """No-op: worker is stopped by the owner. Kept for API compatibility."""
+        pass
 
     def get_position(self) -> Dict[str, float]:
         """Return current NED position (x, y, z)."""
-        with self.lock:
-            return self.position_ned.copy()
+        pos = self._worker.get_position()
+        if pos is None:
+            return dict(_DEFAULT_POSITION)
+        return {"x": pos["x"], "y": pos["y"], "z": pos["z"]}
+
+    def get_attitude(self) -> Dict[str, float]:
+        """Return current Euler angles (roll, pitch, yaw) in radians as rx, ry, rz."""
+        att = self._worker.get_attitude()
+        if att is None:
+            return dict(_DEFAULT_ATTITUDE)
+        return {"rx": att["rx"], "ry": att["ry"], "rz": att["rz"]}
 
     def get_distance_to(self, target_position: Dict[str, float]) -> float:
         """
@@ -112,11 +63,11 @@ class CoordsMonitor:
         Returns:
             Distance in meters.
         """
-        with self.lock:
-            dx = target_position["x"] - self.position_ned["x"]
-            dy = target_position["y"] - self.position_ned["y"]
-            dz = target_position["z"] - self.position_ned["z"]
-            return (dx**2 + dy**2 + dz**2) ** 0.5
+        pos = self.get_position()
+        dx = target_position["x"] - pos["x"]
+        dy = target_position["y"] - pos["y"]
+        dz = target_position["z"] - pos["z"]
+        return (dx**2 + dy**2 + dz**2) ** 0.5
 
     def get_relative_position(
         self, target_position: Dict[str, float]
@@ -130,9 +81,9 @@ class CoordsMonitor:
         Returns:
             Dict with 'x', 'y', 'z' relative offsets in meters.
         """
-        with self.lock:
-            return {
-                "x": target_position["x"] - self.position_ned["x"],
-                "y": target_position["y"] - self.position_ned["y"],
-                "z": target_position["z"] - self.position_ned["z"],
-            }
+        pos = self.get_position()
+        return {
+            "x": target_position["x"] - pos["x"],
+            "y": target_position["y"] - pos["y"],
+            "z": target_position["z"] - pos["z"],
+        }

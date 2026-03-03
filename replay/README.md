@@ -112,6 +112,40 @@ rosrun rviz rviz
 
 ---
 
+## Replay with GUI
+
+A small graphical control window (tkinter) publishes to the same ROS topics as above. **Start the replay process with `--interactive` first**, then start the GUI so both use the same ROS master.
+
+### Launch order (replay with GUI)
+
+1. **Start replay with interactive mode** (so it subscribes to `/replay/play`, `/replay/pause`, `/replay/seek`, `/replay/speed`):
+   - **Host:** `python replay/replay_rviz.py --experiment <PATH> [--rate R] --interactive`
+   - **Docker:** `./scripts/replay-with-rviz.sh EXPERIMENT_PATH [RATE] 1` or `./scripts/replay-docker.sh EXPERIMENT_PATH [RATE] 1`
+2. **Start the GUI** (same host or same Docker network so ROS_MASTER_URI matches):
+   - **Host (ROS on host):** `source /opt/ros/noetic/setup.bash && python replay/replay_gui.py --experiment <PATH>`
+   - Without `--experiment`: run `python replay/replay_gui.py --gui-only` for play/pause/speed only (no seek slider range).
+
+**One-command host flow (replay + GUI):** With `roscore` already running in another terminal, run:  
+`./scripts/replay-with-gui.sh EXPERIMENT_PATH [RATE]` — this starts replay in the background and then the GUI; closing the GUI stops the replay.
+
+### GUI controls
+
+| Control   | Action                                                                 |
+|----------|------------------------------------------------------------------------|
+| **Play** | Publishes `/replay/play` (Empty) — start or resume playback.           |
+| **Pause**| Publishes `/replay/pause` (Empty) — pause playback.                    |
+| **Speed**| Slider 0.25–4.0 — publishes `/replay/speed` (Float32).                  |
+| **Seek** | Slider 0 to duration (s) — publishes `/replay/seek` (Float64).        |
+
+Seek range is computed from the experiment CSV (min/max time) when `--experiment` is given; otherwise the seek slider is omitted (use `--gui-only`).
+
+### Docker and GUI
+
+- **Replay in Docker, GUI on host:** If ROS Noetic runs on the host and can reach the replay container’s roscore (e.g. same network or ROS_MASTER_URI pointing to the container), run the GUI on the host: `python replay/replay_gui.py --experiment experiments/...`. The replay scripts use `--network host`, so roscore in the container is on `localhost:11311`; on the host set `export ROS_MASTER_URI=http://localhost:11311` and run the GUI to control replay in the container.
+- **GUI inside replay container:** The replay Docker image may not show a tkinter window by default; for a GUI inside Docker you’d need X11 forwarding or a VNC/desktop. Prefer running the GUI on the host when ROS is available there.
+
+---
+
 ## Arguments (replay_rviz.py)
 
 | Argument        | Required | Description                                                                 |
@@ -119,6 +153,8 @@ rosrun rviz rviz
 | `--experiment`  | Yes      | Path to experiment directory (contains `metadata.json` and `drone_*.csv`).  |
 | `--rate`        | No       | Playback speed multiplier (default 1.0). With `--interactive`, initial speed.|
 | `--interactive` | No       | Enable play/pause, seek, speed via keyboard and ROS topics.                 |
+
+**replay_gui.py:** `--experiment PATH` — experiment directory (for seek slider range); `--gui-only` — no experiment path, play/pause/speed only.
 
 ## ROS topics
 

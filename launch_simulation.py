@@ -18,6 +18,8 @@ Scenarios run from project root so they can import core.
 """
 
 import argparse
+import logging
+import math
 import os
 import signal
 import subprocess
@@ -25,9 +27,33 @@ import sys
 import time
 from typing import List, Optional, Tuple
 
+logger = logging.getLogger(__name__)
+
 project_root: str = os.path.dirname(os.path.abspath(__file__))
 APM_HOME: str = os.path.join(project_root, "..", "ardupilot")
 SIM_VEHICLE_PATH: str = os.path.join(APM_HOME, "Tools", "autotest", "sim_vehicle.py")
+
+# Per-drone home: sim_vehicle.py uses -l/--custom-location (lat,lon,alt,heading). We use one base
+# and offset East by (drone_index * 2) m so that in a common NED frame drone 0 is at Y=0, 1 at Y=2, etc.
+# East offset in degrees = meters_east / (111320 * cos(lat_rad)).
+BASE_HOME_LAT = 47.0
+BASE_HOME_LON = 8.0
+BASE_HOME_ALT = 0.0
+METERS_PER_DEGREE_EAST = 111320.0 * math.cos(math.radians(BASE_HOME_LAT))
+
+
+def _sitl_home_for_drone(drone_index: int) -> str:
+    """Build lat,lon,alt,heading string for SITL so local NED Y (East) = drone_index * 2 m in common frame.
+
+    Args:
+        drone_index: 0-based drone index (0 -> Y=0, 1 -> Y=2, ...).
+
+    Returns:
+        String for sim_vehicle.py -l/--custom-location (e.g. "47.0,8.0,0,0" or "47.0,8.000018,0,0").
+    """
+    lon_offset_deg = (drone_index * 2.0) / METERS_PER_DEGREE_EAST
+    lon = BASE_HOME_LON + lon_offset_deg
+    return f"{BASE_HOME_LAT},{lon},{BASE_HOME_ALT},0"
 
 # Scenario id, description, script path relative to project_root, cwd = project_root
 SCENARIOS: List[Tuple[str, str, str, str]] = [
@@ -62,8 +88,7 @@ def start_sitl_only(
         List of started subprocess Popen objects, or empty list on error.
     """
     if not os.path.isfile(SIM_VEHICLE_PATH):
-        print(f"Error: not found {SIM_VEHICLE_PATH}")
-        print("ArduPilot must be at ../ardupilot relative to project.")
+        logger.error("Not found %s; ArduPilot must be at ../ardupilot relative to project.", SIM_VEHICLE_PATH)
         return []
     extra_params = []
     if param_file:
@@ -75,6 +100,7 @@ def start_sitl_only(
     cwd = APM_HOME if os.path.isdir(APM_HOME) else proj_root
     for i in range(num_drones):
         udp_port = BASE_UDP_PORT + i * 10
+        home_str = _sitl_home_for_drone(i)
         args = [
             sys.executable,
             SIM_VEHICLE_PATH,
@@ -82,11 +108,12 @@ def start_sitl_only(
             f"--instance={i}",
             f"--sysid={i + 1}",
             f"--out=127.0.0.1:{udp_port}",
+            "-l", home_str,
             "--console",
         ]
         if extra_params:
             args.extend(extra_params)
-        print(f"[SITL] instance={i}, UDP -> 127.0.0.1:{udp_port}")
+        logger.info("[SITL] instance=%s, UDP -> 127.0.0.1:%s, custom_location=%s", i, udp_port, home_str)
         proc = subprocess.Popen(args, cwd=cwd)
         processes.append(proc)
         time.sleep(5)
@@ -109,7 +136,7 @@ def start_sitl_webots(
         Tuple of (list of SITL Popen processes, None placeholder).
     """
     if not os.path.isfile(SIM_VEHICLE_PATH):
-        print(f"Error: not found {SIM_VEHICLE_PATH}")
+        logger.error("Not found %s", SIM_VEHICLE_PATH)
         return [], None
     BASE_TCP = 5770
     BASE_UDP = 14551
@@ -120,6 +147,7 @@ def start_sitl_webots(
     for i in range(num_drones):
         tcp_port = BASE_TCP + i * 10
         udp_port = BASE_UDP + i * 10
+        home_str = _sitl_home_for_drone(i)
         args = [
             sys.executable,
             SIM_VEHICLE_PATH,
@@ -129,11 +157,12 @@ def start_sitl_webots(
             f"--sysid={i + 1}",
             f"--out=127.0.0.1:{tcp_port}",
             f"--out=127.0.0.1:{udp_port}",
+            "-l", home_str,
             "--console",
         ]
         if extra:
             args.extend(extra)
-        print(f"[SITL] instance={i}, TCP={tcp_port}, UDP={udp_port}")
+        logger.info("[SITL] instance=%s, TCP=%s, UDP=%s, custom_location=%s", i, tcp_port, udp_port, home_str)
         proc = subprocess.Popen(args, cwd=cwd)
         processes.append(proc)
         time.sleep(5)
@@ -156,14 +185,14 @@ def launch_webots(
     INPUT_WORLD = os.path.join(WORLDS_DIR, "irisAuto.wbt")
     OUTPUT_WORLD = os.path.join(WORLDS_DIR, "temp_world.wbt")
     if not os.path.isfile(INPUT_WORLD):
-        print(f"Error: world not found {INPUT_WORLD}")
+        logger.error("World not found: %s", INPUT_WORLD)
         return None
     with open(INPUT_WORLD, "r") as f:
         content = f.read()
     insert_marker = "# Insert drones"
     pos = content.find(insert_marker)
     if pos == -1:
-        print("Marker # Insert drones not found in world")
+        logger.error("Marker # Insert drones not found in world")
         return None
     pos += len(insert_marker)
     dx, dy, z = 2.0, 2.0, 0.0549632125
@@ -183,7 +212,7 @@ def launch_webots(
         f.write(new_content)
     env = os.environ.copy()
     env["WEBOTS_PROTO_PATH"] = os.path.join(proj_root, "protos")
-    print("[Webots] Starting...")
+    logger.info("[Webots] Starting...")
     return subprocess.Popen(["webots", OUTPUT_WORLD], env=env)
 
 
@@ -221,8 +250,12 @@ def main() -> None:
     If scenario file is missing or SITL cannot be started, exits with code 1.
     Registers signal handlers for SIGINT/SIGTERM to terminate child processes.
     """
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     parser = argparse.ArgumentParser(
-        description="Launcher: SITL + optional Webots + scenario; use --with-2d-visualizer for live 2D plot",
+        description=(
+            "Launcher: SITL + optional Webots + scenario; "
+            "use --with-2d-visualizer for live 2D plot"
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -237,7 +270,10 @@ Examples:
         "-c", "--scenario", type=str,
         help="Scenario ID: " + ", ".join(s[0] for s in SCENARIOS),
     )
-    parser.add_argument("-n", "--drones", type=int, default=2, metavar="N", help="Number of drones (default 2)")
+    parser.add_argument(
+        "-n", "--drones", type=int, default=2, metavar="N",
+        help="Number of drones (default 2)",
+    )
     parser.add_argument(
         "--param-file",
         type=str,
@@ -250,16 +286,31 @@ Examples:
     )
     parser.add_argument(
         "--duration", type=float, default=0, metavar="T",
-        help="Experiment duration (s); 0 = no limit. Passed to all scenarios; leader_forward_back has full support.",
+        help=(
+            "Experiment duration (s); 0 = no limit. "
+            "Passed to all scenarios; leader_forward_back has full support."
+        ),
     )
     parser.add_argument(
         "--experiment-dir", type=str, default=None,
-        help="Experiment log folder. Passed to all scenarios; leader_forward_back has full support.",
+        help=(
+            "Experiment log folder. Passed to all scenarios; "
+            "leader_forward_back has full support."
+        ),
     )
     parser.add_argument(
         "--with-2d-visualizer",
         action="store_true",
         help="Start 2D matplotlib visualizer subprocess before the scenario.",
+    )
+    parser.add_argument(
+        "--exchange-hz",
+        type=float,
+        default=50.0,
+        help=(
+            "Coordinate exchange loop rate (Hz); match SITL position stream. "
+            "Passed to scenario (default 50)."
+        ),
     )
     args = parser.parse_args()
 
@@ -282,7 +333,7 @@ Examples:
         else script_rel
     )
     if not os.path.isfile(script_path):
-        print(f"Error: scenario not found: {script_path}")
+        logger.error("Scenario not found: %s", script_path)
         sys.exit(1)
 
     processes = []
@@ -301,7 +352,7 @@ Examples:
     if not processes:
         sys.exit(1)
 
-    print("[Launcher] Waiting for SITL (arm/takeoff)...")
+    logger.info("[Launcher] Waiting for SITL (arm/takeoff)...")
     time.sleep(8)
 
     if use_2d_visualizer:
@@ -314,16 +365,19 @@ Examples:
                 stderr=sys.stderr,
             )
             processes.append(visualizer_proc)
-            print("[Launcher] Started 2D visualizer subprocess.")
+            logger.info("[Launcher] Started 2D visualizer subprocess.")
         else:
-            print(f"[Launcher] 2D visualizer script not found: {visualizer_script}")
+            logger.warning("[Launcher] 2D visualizer script not found: %s", visualizer_script)
 
-    print(f"[Scenario] Starting: {scenario_desc}")
+    logger.info("[Scenario] Starting: %s", scenario_desc)
     scenario_cmd = [sys.executable, script_rel, "--drones", str(num_drones)]
     if getattr(args, "duration", 0) > 0:
         scenario_cmd.extend(["--duration", str(args.duration)])
     if getattr(args, "experiment_dir", None):
         scenario_cmd.extend(["--experiment-dir", args.experiment_dir])
+    exchange_hz = getattr(args, "exchange_hz", 50.0)
+    if exchange_hz > 0:
+        scenario_cmd.extend(["--exchange-hz", str(exchange_hz)])
     scenario_proc = subprocess.Popen(
         scenario_cmd,
         cwd=scenario_cwd,
@@ -332,8 +386,8 @@ Examples:
     )
     processes.append(scenario_proc)
 
-    def shutdown(signum=None, frame=None):
-        print("\n[Launcher] Stopping processes...")
+    def shutdown(signum: Optional[int] = None, frame: Optional[object] = None) -> None:
+        logger.info("[Launcher] Stopping processes...")
         for p in processes:
             try:
                 p.terminate()
