@@ -15,16 +15,16 @@ if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 import argparse
+import logging
 import threading
 import time
 from datetime import datetime
-from typing import Tuple
+from typing import Any, Dict, Optional, Tuple
 
-from pymavlink import mavutil
+logger = logging.getLogger(__name__)
 
-from core.control.pid import PIDRegulator
-from core.mavlink.utils import RC_NEUTRAL, send_rc_override
-from core.monitors.velocity_monitor import VelocityMonitor
+from core.control import DroneController, PIDRegulator
+from core.mavlink.utils import RC_NEUTRAL
 
 # Square step commands (roll, pitch, throttle, yaw)
 SQUARE_STEPS = [
@@ -35,28 +35,42 @@ SQUARE_STEPS = [
 ]
 STEP_DURATION = 2  # seconds per segment
 
+SQUARE_INIT_STEPS = [
+    {"type": "set_mode", "mode_id": 4},
+    {"type": "sleep", "sec": 0.5},
+    {"type": "arm"},
+    {"type": "sleep", "sec": 2},
+    {"type": "takeoff"},
+    {"type": "sleep", "sec": 5},
+    {"type": "set_mode", "mode_id": 2},
+    {
+        "type": "rc_override",
+        "chan1": RC_NEUTRAL,
+        "chan2": RC_NEUTRAL,
+        "chan3": RC_NEUTRAL,
+        "chan4": RC_NEUTRAL,
+    },
+    {"type": "sleep", "sec": 0.5},
+]
 
-class DroneController:
-    """Controller for one drone: connection, velocity monitor, PID braking."""
 
-    def __init__(self, config: dict, logging_enabled: bool = False) -> None:
-        """Initialize controller with config and optional file logging.
+class SquareDroneController(DroneController):
+    """DroneController with velocity PIDs and move_with_pid_braking for square pattern."""
+
+    def __init__(
+        self, config: Dict[str, Any], logging_enabled: bool = False
+    ) -> None:
+        """Initialize square-formation controller with velocity PIDs.
 
         Args:
             config: Dict with 'id', 'udp_port', 'role'.
-            logging_enabled: If True, write velocity logs to logs_SQUARE_two_drones/.
+            logging_enabled: If True, write logs to log_dir.
         """
-        self.config = config
-        self.master = None
-        self.velocity_monitor = None
-        self.lock = threading.Lock()
-        self.logging_enabled = logging_enabled
-        if self.logging_enabled:
-            self.logIter = 0
-            os.makedirs("logs_SQUARE_two_drones", exist_ok=True)
-            self.logfile = open(
-                f"logs_SQUARE_two_drones/drone_{self.config['id']}_log.txt", "w"
-            )
+        super().__init__(
+            config,
+            logging_enabled=logging_enabled,
+            log_dir="logs_SQUARE_two_drones",
+        )
         self.roll_velocity_pid = PIDRegulator(
             kp=100.0,
             ki=100.0,
@@ -71,66 +85,7 @@ class DroneController:
             integral_limit=200.0,
             output_limit=500.0,
         )
-        self.last_movement_mode = None
-        self.last_rc_channels = {
-            "roll": RC_NEUTRAL,
-            "pitch": RC_NEUTRAL,
-            "throttle": RC_NEUTRAL,
-            "yaw": RC_NEUTRAL,
-        }
-        self.rc_channels_lock = threading.Lock()
-
-    def connect(self) -> None:
-        """Establish MAVLink connection and create VelocityMonitor."""
-        self.master = mavutil.mavlink_connection(
-            f'udp:127.0.0.1:{self.config["udp_port"]}'
-        )
-        self.master.wait_heartbeat()
-        self.velocity_monitor = VelocityMonitor(self.master)
-
-    def initialize(self) -> None:
-        """Arm, take off, switch to ALT_HOLD, start velocity monitor."""
-        self.master.set_mode(4)  # GUIDED
-        time.sleep(0.5)
-        self.master.arducopter_arm()
-        time.sleep(2)
-        self.master.mav.command_long_send(
-            self.master.target_system,
-            self.master.target_component,
-            mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
-            0, 0, 0, 0, 0, 0, 0, 1,
-        )
-        time.sleep(5)
-        self.master.set_mode(2)  # ALT_HOLD
-        send_rc_override(
-            self.master,
-            RC_NEUTRAL,
-            RC_NEUTRAL,
-            RC_NEUTRAL,
-            RC_NEUTRAL,
-            controller=self,
-        )
-        time.sleep(0.5)
-        self.velocity_monitor.start()
-
-    def start_rc_keepalive(self) -> None:
-        """Start a daemon thread that periodically sends RC_OVERRIDE to keep commands active."""
-        def keepalive_loop() -> None:
-            while True:
-                try:
-                    with self.rc_channels_lock:
-                        roll = self.last_rc_channels["roll"]
-                        pitch = self.last_rc_channels["pitch"]
-                        throttle = self.last_rc_channels["throttle"]
-                        yaw = self.last_rc_channels["yaw"]
-                    send_rc_override(
-                        self.master, roll, pitch, throttle, yaw, controller=self
-                    )
-                    time.sleep(0.2)
-                except Exception:
-                    break
-
-        threading.Thread(target=keepalive_loop, daemon=True).start()
+        self.last_movement_mode: Optional[str] = None
 
     def move_with_pid_braking(
         self,
@@ -143,17 +98,20 @@ class DroneController:
         velocity_threshold: float = 0.8,
         use_pid: bool = True,
     ) -> None:
-        """Apply direction (roll, pitch, throttle, yaw) then brake to target_velocity with PID.
+        """Apply direction then brake to target_velocity with PID.
 
         Args:
-            direction: (roll, pitch, throttle, yaw) RC values for the move phase.
-            kpx: Proportional gain for pitch braking (when use_pid=False).
-            kpy: Proportional gain for roll braking (when use_pid=False).
+            direction: (roll, pitch, throttle, yaw) RC channel values for move phase.
+            kpx: Pitch braking gain when use_pid is False.
+            kpy: Roll braking gain when use_pid is False.
             move_duration: Seconds to apply direction before braking.
-            target_velocity: Target vx/vy for brake phase (typically 0).
-            max_brake_time: Maximum seconds to spend braking.
-            velocity_threshold: Stop braking when |vx| and |vy| are below this.
-            use_pid: If True, use velocity PIDs for braking; else use kpx/kpy.
+            target_velocity: Target vx, vy for brake phase (m/s).
+            max_brake_time: Max seconds to run brake phase.
+            velocity_threshold: End brake when |vx|,|vy| below this (m/s).
+            use_pid: If True, use velocity PIDs for braking; else use kpx/kpy gains.
+
+        Returns:
+            None. Sends RC_OVERRIDE via worker until brake complete or timeout.
         """
         roll, pitch, throttle, yaw = direction
         if self.last_movement_mode != "moving":
@@ -162,9 +120,10 @@ class DroneController:
         self.last_movement_mode = "moving"
         start = time.time()
         while time.time() - start < move_duration:
-            send_rc_override(
-                self.master, roll, pitch, throttle, yaw, controller=self
-            )
+            if self.worker:
+                self.worker.send_rc_override(
+                    roll, pitch, throttle, yaw, controller=self
+                )
             time.sleep(0.1)
         self.last_movement_mode = "braking"
         start_time = time.time()
@@ -175,6 +134,8 @@ class DroneController:
             if dt <= 0:
                 dt = 0.05
             last_update_time = current_time
+            if self.velocity_monitor is None:
+                break
             current_velocity = self.velocity_monitor.get_velocity()
             current_x_velocity = current_velocity["vx"]
             current_y_velocity = current_velocity["vy"]
@@ -223,30 +184,16 @@ class DroneController:
                     )
                 else:
                     brake_roll = RC_NEUTRAL
-            send_rc_override(
-                self.master, brake_roll, brake_pitch, RC_NEUTRAL, RC_NEUTRAL,
-                controller=self,
-            )
+            if self.worker:
+                self.worker.send_rc_override(
+                    brake_roll, brake_pitch, RC_NEUTRAL, RC_NEUTRAL,
+                    controller=self,
+                )
             time.sleep(0.05)
-
-    def stop(self) -> None:
-        """Send neutral RC, stop velocity monitor, close log if enabled, command LAND."""
-        send_rc_override(
-            self.master,
-            RC_NEUTRAL,
-            RC_NEUTRAL,
-            RC_NEUTRAL,
-            RC_NEUTRAL,
-            controller=self,
-        )
-        self.velocity_monitor.stop()
-        if self.logging_enabled:
-            self.logfile.close()
-        self.master.set_mode(9)  # LAND
 
 
 def square_pattern(
-    controller: DroneController,
+    controller: SquareDroneController,
     step_duration: float = 2,
     kpx: float = 100,
     kpy: float = 100,
@@ -275,29 +222,28 @@ def square_pattern(
                 velocity_threshold=velocity_threshold,
                 use_pid=use_pid,
             )
-            send_rc_override(
-                controller.master,
-                RC_NEUTRAL,
-                RC_NEUTRAL,
-                RC_NEUTRAL,
-                RC_NEUTRAL,
-                controller=controller,
-            )
+            if controller.worker:
+                controller.worker.send_rc_override(
+                    RC_NEUTRAL,
+                    RC_NEUTRAL,
+                    RC_NEUTRAL,
+                    RC_NEUTRAL,
+                    controller=controller,
+                )
             time.sleep(1)
 
 
 def initialize_drone_parallel(
-    controller: DroneController, init_barrier: threading.Barrier
+    controller: SquareDroneController, init_barrier: threading.Barrier
 ) -> None:
     """Connect, initialize, start RC keepalive, then wait on barrier (called from worker thread)."""
     try:
         controller.connect()
-        controller.initialize()
+        controller.initialize(SQUARE_INIT_STEPS)
         controller.start_rc_keepalive()
         init_barrier.wait()
     except Exception:
-        import traceback
-        traceback.print_exc()
+        logger.exception("Drone init failed")
         raise
 
 
@@ -320,7 +266,7 @@ def main() -> None:
     ]
     controllers = []
     for config in DRONES_CONFIG:
-        controllers.append(DroneController(config, logging_enabled=True))
+        controllers.append(SquareDroneController(config, logging_enabled=True))
     init_barrier = threading.Barrier(len(controllers) + 1)
     for controller in controllers:
         threading.Thread(
@@ -355,7 +301,6 @@ def main() -> None:
     except KeyboardInterrupt:
         for controller in controllers:
             controller.stop()
-            controller.master.set_mode(9)
 
 
 if __name__ == "__main__":

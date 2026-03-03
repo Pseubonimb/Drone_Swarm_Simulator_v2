@@ -10,23 +10,17 @@ _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
+import logging
 import threading
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from pymavlink import mavutil
+logger = logging.getLogger(__name__)
 
-from core.control.pid import PIDRegulator
+from core.control import DroneController, PIDRegulator
 from core.logging.csv_logger import CSV_HEADER, write_metadata, write_row
-from core.mavlink.utils import (
-    RC_NEUTRAL,
-    request_attitude_stream_rate,
-    request_position_stream_rate,
-    send_rc_override,
-)
-from core.monitors.coords_monitor import CoordsMonitor
-from core.monitors.velocity_monitor import VelocityMonitor
+from core.mavlink.utils import RC_NEUTRAL
 
 try:
     from visualizer.position_publisher import publish_positions as _publish_positions
@@ -42,162 +36,83 @@ EXCHANGE_HZ_WINDOW = 20
 
 START_TIME = 0.0
 
+LEADER_INIT_STEPS = [
+    {"type": "set_mode", "mode_id": 4},
+    {"type": "sleep", "sec": 0.5},
+    {"type": "arm"},
+    {"type": "sleep", "sec": 2},
+    {"type": "takeoff"},
+    {"type": "sleep", "sec": 5},
+    {"type": "set_mode", "mode_id": 16},
+    {
+        "type": "rc_override",
+        "chan1": RC_NEUTRAL,
+        "chan2": RC_NEUTRAL,
+        "chan3": RC_NEUTRAL,
+        "chan4": RC_NEUTRAL,
+    },
+    {"type": "sleep", "sec": 0.5},
+    {"type": "request_position_stream", "hz": 50},
+    {"type": "request_attitude_stream", "hz": 50},
+    {"type": "sleep", "sec": 0.2},
+]
 
-class DroneController:
-    """Controller for one drone: connection, monitors, PIDs, RC keepalive."""
 
-    def __init__(self, config: dict, logging_enabled: bool = False) -> None:
-        """Initialize controller with config and optional file logging.
+def move_towards_with_pid(
+    controller: DroneController,
+    target_position: Dict[str, float],
+    roll_pid: Optional[PIDRegulator] = None,
+    pitch_pid: Optional[PIDRegulator] = None,
+    dt: Optional[float] = None,
+    distance_threshold: float = 0.4,
+) -> None:
+    """Move controller toward target using optional PIDs; send neutral if within threshold.
 
-        Args:
-            config: Dict with 'id', 'udp_port', 'role'.
-            logging_enabled: If True, write position logs to logs/drone_<id>_log.txt.
-        """
-        self.config = config
-        self.master = None
-        self.coords_monitor = None
-        self.velocity_monitor = None
-        self.other_drones_positions: dict = {}
-        self.lock = threading.Lock()
-        self.logging_enabled = logging_enabled
-        if self.logging_enabled:
-            self.logIter = 0
-            os.makedirs("logs", exist_ok=True)
-            self.logfile = open(f"logs/drone_{self.config['id']}_log.txt", "w")
-        self.last_movement_mode = None
-        self.last_rc_channels = {
-            "roll": RC_NEUTRAL,
-            "pitch": RC_NEUTRAL,
-            "throttle": RC_NEUTRAL,
-            "yaw": RC_NEUTRAL,
-        }
-        self.rc_channels_lock = threading.Lock()
+    Args:
+        controller: Drone controller with coords_monitor and worker.
+        target_position: Target NED position dict with 'x', 'y', 'z'.
+        roll_pid: Optional PID for lateral (y) error.
+        pitch_pid: Optional PID for longitudinal (x) error.
+        dt: Optional time step for PID update (seconds).
+        distance_threshold: Distance below which to send neutral and reset PIDs (meters).
 
-    def connect(self) -> None:
-        """Establish MAVLink connection and create CoordsMonitor/VelocityMonitor."""
-        self.master = mavutil.mavlink_connection(
-            f'udp:127.0.0.1:{self.config["udp_port"]}'
-        )
-        self.master.wait_heartbeat()
-        self.coords_monitor = CoordsMonitor(self.master)
-        self.velocity_monitor = VelocityMonitor(self.master)
-
-    def initialize(self) -> None:
-        """Arm, take off, switch to POS_HOLD, start position/attitude streams and monitors."""
-        self.master.set_mode(4)  # GUIDED
-        time.sleep(0.5)
-        self.master.arducopter_arm()
-        time.sleep(2)
-        self.master.mav.command_long_send(
-            self.master.target_system,
-            self.master.target_component,
-            mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
-            0, 0, 0, 0, 0, 0, 0, 1,
-        )
-        time.sleep(5)
-        self.master.set_mode(16)  # POS_HOLD
-        send_rc_override(
-            self.master, RC_NEUTRAL, RC_NEUTRAL, RC_NEUTRAL, RC_NEUTRAL,
-            controller=self,
-        )
-        time.sleep(0.5)
-        request_position_stream_rate(self.master, hz=50)
-        request_attitude_stream_rate(self.master, hz=50)
-        time.sleep(0.2)
-        self.coords_monitor.start()
-        self.velocity_monitor.start()
-
-    def start_rc_keepalive(self) -> None:
-        """Start a daemon thread that periodically sends RC_OVERRIDE to keep commands active."""
-        def keepalive_loop() -> None:
-            while True:
-                try:
-                    with self.rc_channels_lock:
-                        roll = self.last_rc_channels["roll"]
-                        pitch = self.last_rc_channels["pitch"]
-                        throttle = self.last_rc_channels["throttle"]
-                        yaw = self.last_rc_channels["yaw"]
-                    send_rc_override(
-                        self.master, roll, pitch, throttle, yaw, controller=self
-                    )
-                    time.sleep(0.2)
-                except Exception:
-                    break
-
-        threading.Thread(target=keepalive_loop, daemon=True).start()
-
-    def update_other_drone_position(
-        self, drone_id: int, position: Dict[str, float]
-    ) -> None:
-        """Store another drone's position for formation/coordination."""
-        with self.lock:
-            self.other_drones_positions[drone_id] = position
-
-    def get_my_position(self) -> Dict[str, float]:
-        """Return this drone's last known position (NED)."""
-        my_position = self.coords_monitor.get_position()
-        if self.logging_enabled:
-            self.logIter += 1
-            if self.logIter % 20 == 0:
-                self.logfile.write(f"{my_position}\n")
-        return my_position
-
-    def move_towards_with_pid(
-        self,
-        target_position: Dict[str, float],
-        roll_pid: Optional[PIDRegulator] = None,
-        pitch_pid: Optional[PIDRegulator] = None,
-        dt: Optional[float] = None,
-        distance_threshold: float = 0.4,
-    ) -> None:
-        """Move toward target using optional PIDs; send neutral if within threshold."""
-        rel_pos = self.coords_monitor.get_relative_position(target_position)
-        error_x = rel_pos["x"]
-        error_y = rel_pos["y"] - 2
-        distance = (error_x**2 + error_y**2) ** 0.5
-        if distance < distance_threshold:
-            send_rc_override(
-                self.master,
-                RC_NEUTRAL,
-                RC_NEUTRAL,
-                RC_NEUTRAL,
-                RC_NEUTRAL,
-                controller=self,
-            )
-            if roll_pid is not None:
-                roll_pid.reset()
-            if pitch_pid is not None:
-                pitch_pid.reset()
-            return
-        pitch_output = (
-            pitch_pid.update(error_x, dt=dt)
-            if pitch_pid is not None
-            else error_x * 500.0
-        )
-        roll_output = (
-            roll_pid.update(error_y, dt=dt)
-            if roll_pid is not None
-            else error_y * 500.0
-        )
-        pitch = RC_NEUTRAL - int(pitch_output)
-        roll = RC_NEUTRAL + int(roll_output)
-        send_rc_override(
-            self.master, roll, pitch, RC_NEUTRAL, RC_NEUTRAL, controller=self
-        )
-
-    def stop(self) -> None:
-        """Send neutral RC, stop monitors, and command LAND."""
-        send_rc_override(
-            self.master,
+    Returns:
+        None. Sends RC_OVERRIDE via controller.worker.
+    """
+    if controller.coords_monitor is None or controller.worker is None:
+        return
+    rel_pos = controller.coords_monitor.get_relative_position(target_position)
+    error_x = rel_pos["x"]
+    error_y = rel_pos["y"] - 2
+    distance = (error_x**2 + error_y**2) ** 0.5
+    if distance < distance_threshold:
+        controller.worker.send_rc_override(
             RC_NEUTRAL,
             RC_NEUTRAL,
             RC_NEUTRAL,
             RC_NEUTRAL,
-            controller=self,
+            controller=controller,
         )
-        self.coords_monitor.stop()
-        self.velocity_monitor.stop()
-        self.master.set_mode(9)  # LAND
+        if roll_pid is not None:
+            roll_pid.reset()
+        if pitch_pid is not None:
+            pitch_pid.reset()
+        return
+    pitch_output = (
+        pitch_pid.update(error_x, dt=dt)
+        if pitch_pid is not None
+        else error_x * 500.0
+    )
+    roll_output = (
+        roll_pid.update(error_y, dt=dt)
+        if roll_pid is not None
+        else error_y * 500.0
+    )
+    pitch = RC_NEUTRAL - int(pitch_output)
+    roll = RC_NEUTRAL + int(roll_output)
+    controller.worker.send_rc_override(
+        roll, pitch, RC_NEUTRAL, RC_NEUTRAL, controller=controller
+    )
 
 
 def leader_pattern(
@@ -208,30 +123,27 @@ def leader_pattern(
     """Leader: forward → stop → backward → stop. pitch 1400=forward, 1600=backward.
 
     Args:
-        controller: Leader drone controller (MAVLink connected).
+        controller: Leader drone controller (MAVLink worker).
         forward_duration: Seconds to fly forward and again backward before stopping.
         experiment_duration: If > 0, stop when global experiment time exceeds this (s).
     """
     global START_TIME
+    if not controller.worker:
+        return
     start = time.time()
     while time.time() - start < forward_duration:
         if experiment_duration > 0 and (time.time() - START_TIME) >= experiment_duration:
             break
-        send_rc_override(
-            controller.master, RC_NEUTRAL, 1400, 1500, 1500, controller
+        controller.worker.send_rc_override(
+            RC_NEUTRAL, 1400, 1500, 1500, controller
         )
         time.sleep(0.1)
-    controller.master.set_mode(17)  # BRAKE
+    controller.worker.send_set_mode(17)  # BRAKE
     time.sleep(2)
-    controller.master.set_mode(16)  # POS_HOLD
+    controller.worker.send_set_mode(16)  # POS_HOLD
     time.sleep(0.3)
-    send_rc_override(
-        controller.master,
-        RC_NEUTRAL,
-        RC_NEUTRAL,
-        RC_NEUTRAL,
-        RC_NEUTRAL,
-        controller=controller,
+    controller.worker.send_rc_override(
+        RC_NEUTRAL, RC_NEUTRAL, RC_NEUTRAL, RC_NEUTRAL, controller=controller
     )
     time.sleep(0.5)
     if experiment_duration > 0 and (time.time() - START_TIME) >= experiment_duration:
@@ -240,21 +152,16 @@ def leader_pattern(
     while time.time() - start < forward_duration:
         if experiment_duration > 0 and (time.time() - START_TIME) >= experiment_duration:
             break
-        send_rc_override(
-            controller.master, RC_NEUTRAL, 1600, 1500, 1500, controller
+        controller.worker.send_rc_override(
+            RC_NEUTRAL, 1600, 1500, 1500, controller
         )
         time.sleep(0.1)
-    controller.master.set_mode(17)
+    controller.worker.send_set_mode(17)
     time.sleep(2)
-    controller.master.set_mode(16)
+    controller.worker.send_set_mode(16)
     time.sleep(0.3)
-    send_rc_override(
-        controller.master,
-        RC_NEUTRAL,
-        RC_NEUTRAL,
-        RC_NEUTRAL,
-        RC_NEUTRAL,
-        controller=controller,
+    controller.worker.send_rc_override(
+        RC_NEUTRAL, RC_NEUTRAL, RC_NEUTRAL, RC_NEUTRAL, controller=controller
     )
 
 
@@ -300,7 +207,8 @@ def follower_loop(
         while True:
             if experiment_duration > 0 and (time.time() - START_TIME) >= experiment_duration:
                 break
-            if target_drone_id not in controller.other_drones_positions:
+            other_positions = controller.get_other_drones_positions()
+            if target_drone_id not in other_positions:
                 time.sleep(0.1)
                 continue
             now = time.time()
@@ -311,7 +219,7 @@ def follower_loop(
                 if len(FOLLOWER_HZ_HISTORY) > FOLLOWER_HZ_WINDOW:
                     FOLLOWER_HZ_HISTORY = FOLLOWER_HZ_HISTORY[-FOLLOWER_HZ_WINDOW:]
                 RATES_SHARED["follower_hz"] = sum(FOLLOWER_HZ_HISTORY) / len(FOLLOWER_HZ_HISTORY)
-            leader_pos = controller.other_drones_positions[target_drone_id]
+            leader_pos = other_positions[target_drone_id]
             follower_pos = controller.get_my_position()
             rel_pos = controller.coords_monitor.get_relative_position(leader_pos)
             error_x = rel_pos["x"]
@@ -330,8 +238,8 @@ def follower_loop(
                 if (control_loop_period_sec is not None and control_loop_period_sec > 0)
                 else None
             )
-            controller.move_towards_with_pid(
-                leader_pos, roll_pid, pitch_pid, dt=dt_loop
+            move_towards_with_pid(
+                controller, leader_pos, roll_pid, pitch_pid, dt=dt_loop
             )
             if dt_loop is not None:
                 time.sleep(dt_loop)
@@ -388,11 +296,14 @@ def coordinate_exchange_loop(
     duration: float = 0,
     collision_radius: float = 0.2,
     log_hz: float = 0.0,
+    exchange_loop_hz: float = 50.0,
 ) -> None:
     """Exchange positions between drones, compute collisions, write CSV rows until duration.
 
-    CSV is written only when position or attitude has changed (sync with SITL update rate).
-    Optionally log_hz caps the write rate (e.g. match SITL LOCAL_POSITION_NED rate).
+    Loop rate is synchronized with SITL position stream (exchange_loop_hz, default 50 Hz).
+    CSV is written only when position/attitude changed; log_hz optionally caps write rate.
+    Aligning loop rate with SITL avoids flooding the 2D visualizer and reduces lag.
+    Reported exchange_hz is the actual loop rate (full period including sleep), not just body time.
 
     Args:
         controllers: List of drone controllers (each has get_my_position, update_other_drone_position).
@@ -400,11 +311,13 @@ def coordinate_exchange_loop(
         duration: If > 0, stop when time since START_TIME exceeds this (s).
         collision_radius: Sphere radius for collision detection (m); collision if distance < 2*radius.
         log_hz: Max CSV write rate (Hz); 0 = write only when position/attitude changed (full sync with SITL).
+        exchange_loop_hz: Main loop rate (Hz); 0 = no limit. Use 50 to match SITL LOCAL_POSITION_NED rate.
     """
     global EXCHANGE_HZ_HISTORY, START_TIME
     last_written: Dict[int, tuple] = {}  # drone_id -> (x, y, z, rx, ry, rz)
     last_csv_log_time = 0.0
     log_period = (1.0 / log_hz) if log_hz > 0 else 0.0
+    loop_period = (1.0 / exchange_loop_hz) if exchange_loop_hz > 0 else 0.0
     try:
         while True:
             if duration > 0 and (time.time() - START_TIME) >= duration:
@@ -420,14 +333,6 @@ def coordinate_exchange_loop(
                 for drone_id, position in positions.items():
                     if drone_id != controller.config["id"]:
                         controller.update_other_drone_position(drone_id, position)
-            dt_exchange = time.time() - t0
-            if dt_exchange > 0:
-                EXCHANGE_HZ_HISTORY.append(1.0 / dt_exchange)
-                if len(EXCHANGE_HZ_HISTORY) > EXCHANGE_HZ_WINDOW:
-                    EXCHANGE_HZ_HISTORY = EXCHANGE_HZ_HISTORY[-EXCHANGE_HZ_WINDOW:]
-                RATES_SHARED["exchange_hz"] = (
-                    sum(EXCHANGE_HZ_HISTORY) / len(EXCHANGE_HZ_HISTORY)
-                )
             RATES_SHARED["webots_step_hz"] = _read_webots_step_hz(
                 num_instances=len(controllers)
             )
@@ -448,8 +353,11 @@ def coordinate_exchange_loop(
                     did = controller.config["id"]
                     pos = positions[did]
                     att = attitudes[did]
+                    # Initial row: enforce Y=(k-1)*2 so 2D viz and replay show correct spacing
+                    is_first_row = did not in last_written
+                    y_val = (did - 1) * 2.0 if is_first_row else pos["y"]
                     state = (
-                        pos["x"], pos["y"], pos["z"],
+                        pos["x"], y_val, pos["z"],
                         att["rx"], att["ry"], att["rz"],
                     )
                     changed = last_written.get(did) != state
@@ -461,7 +369,7 @@ def coordinate_exchange_loop(
                             did,
                             t,
                             pos["x"],
-                            pos["y"],
+                            y_val,
                             pos["z"],
                             att["rx"],
                             att["ry"],
@@ -471,6 +379,20 @@ def coordinate_exchange_loop(
                         wrote_this_iter = True
                 if wrote_this_iter:
                     last_csv_log_time = now
+            if loop_period > 0:
+                elapsed = time.time() - t0
+                sleep_sec = loop_period - elapsed
+                if sleep_sec > 0:
+                    time.sleep(sleep_sec)
+            # Report actual loop rate (full period including sleep), not just body time
+            dt_full = time.time() - t0
+            if dt_full > 0:
+                EXCHANGE_HZ_HISTORY.append(1.0 / dt_full)
+                if len(EXCHANGE_HZ_HISTORY) > EXCHANGE_HZ_WINDOW:
+                    EXCHANGE_HZ_HISTORY = EXCHANGE_HZ_HISTORY[-EXCHANGE_HZ_WINDOW:]
+                RATES_SHARED["exchange_hz"] = (
+                    sum(EXCHANGE_HZ_HISTORY) / len(EXCHANGE_HZ_HISTORY)
+                )
     finally:
         if experiment_log_files:
             for did, f in experiment_log_files.items():
@@ -486,12 +408,11 @@ def initialize_drone_parallel(
     """Connect, initialize, start RC keepalive, then wait on barrier (called from worker thread)."""
     try:
         controller.connect()
-        controller.initialize()
+        controller.initialize(LEADER_INIT_STEPS)
         controller.start_rc_keepalive()
         init_barrier.wait()
     except Exception:
-        import traceback
-        traceback.print_exc()
+        logger.exception("Drone init failed")
         raise
 
 
@@ -547,6 +468,12 @@ def main() -> None:
         type=float,
         default=0.0,
         help="Max CSV log write rate (Hz); 0 = write only when position/attitude changed (sync with SITL)",
+    )
+    parser.add_argument(
+        "--exchange-hz",
+        type=float,
+        default=50.0,
+        help="Coordinate exchange loop rate (Hz); match SITL position stream (default 50). 0 = no limit.",
     )
     args = parser.parse_args()
     args.control_loop_period_sec = (
@@ -614,6 +541,7 @@ def main() -> None:
             "duration": args.duration,
             "collision_radius": args.collision_radius,
             "log_hz": getattr(args, "log_hz", 0.0),
+            "exchange_loop_hz": getattr(args, "exchange_hz", 50.0),
         },
         daemon=True,
     ).start()
@@ -657,7 +585,6 @@ def main() -> None:
                 for controller in controllers:
                     try:
                         controller.stop()
-                        controller.master.set_mode(9)
                     except Exception:
                         pass
         else:
@@ -666,7 +593,6 @@ def main() -> None:
         for controller in controllers:
             try:
                 controller.stop()
-                controller.master.set_mode(9)
             except Exception:
                 pass
 

@@ -14,8 +14,9 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # Ensure project root is on path when run as script
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -97,7 +98,9 @@ def run_replay(
     duration_sec = metadata.get("duration_sec", 0)
 
     # Pre-load all steps for animation (align by time)
-    steps_list: List[tuple] = list(iter_steps(loaded=loaded, align="t"))
+    steps_list: List[Tuple[float, List[Optional[Dict[str, Any]]]]]] = list(
+        iter_steps(loaded=loaded, align="t")
+    )
     if not steps_list:
         logger.error("No steps in experiment.")
         sys.exit(1)
@@ -119,7 +122,10 @@ def run_replay(
     trail_n = max(0, trail)
     lines: Dict[int, Any] = {}
     points: Dict[int, Any] = {}
-    histories: Dict[int, List[tuple]] = {i: [] for i in range(1, num_drones + 1)}
+    histories: Dict[int, List[Tuple[float, float]]] = {
+        i: [] for i in range(1, num_drones + 1)
+    }
+    t0: List[float] = [0.0]
 
     for i in range(1, num_drones + 1):
         color = PALETTE[(i - 1) % len(PALETTE)]
@@ -185,10 +191,12 @@ def run_replay(
         step_index[0] += 1
 
         # Throttle by real time so playback rate is respected
-        if idx + 1 < len(steps):
-            next_t = steps[idx + 1][0]
+        if idx == 0:
+            t0[0] = time.monotonic()
+        if idx + 1 < len(steps_list):
+            next_t = steps_list[idx + 1][0]
             dt = (next_t - t) / rate if rate > 0 else 0
-            target = t0[0] + (next_t - steps[0][0]) / rate
+            target = t0[0] + (next_t - steps_list[0][0]) / rate
             sleep = target - time.monotonic()
             if sleep > 0:
                 time.sleep(min(sleep, interval))

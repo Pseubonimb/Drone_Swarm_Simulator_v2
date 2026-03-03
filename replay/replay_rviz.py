@@ -302,7 +302,7 @@ def main() -> None:
         sys.exit(1)
 
     num_drones = len(drone_logs)
-    steps = list(iter_steps(loaded=data, align="shortest"))
+    steps = list(iter_steps(loaded=data, align="t"))
     if not steps:
         logger.error("No steps from iter_steps.")
         sys.exit(1)
