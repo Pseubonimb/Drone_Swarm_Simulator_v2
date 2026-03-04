@@ -62,9 +62,43 @@ def downsample_unique_positions(arr: np.ndarray, min_dt: float = 0.0) -> np.ndar
     return np.array(out)
 
 
+def load_position_errors(path: str) -> tuple[np.ndarray, list[int]]:
+    """Load position_errors.csv; return (array with t in col 0 and errors in cols 1..), list of drone ids."""
+    t_list = []
+    err_cols: list[list[float]] = []
+    drone_ids: list[int] = []
+    with open(path, "r", encoding="utf-8") as f:
+        header = f.readline().strip()
+        if not header.startswith("t,"):
+            return np.zeros((0, 1)), []
+        parts = header.split(",")
+        for i in range(1, len(parts)):
+            if parts[i].startswith("drone_"):
+                try:
+                    drone_ids.append(int(parts[i].replace("drone_", "")))
+                except ValueError:
+                    pass
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            vals = line.split(",")
+            if len(vals) != 1 + len(drone_ids):
+                continue
+            try:
+                t_list.append(float(vals[0]))
+                err_cols.append([float(vals[j + 1]) for j in range(len(drone_ids))])
+            except ValueError:
+                continue
+    if not t_list:
+        return np.zeros((0, 1 + len(drone_ids))), drone_ids
+    arr = np.column_stack([np.array(t_list)] + [np.array([r[j] for r in err_cols]) for j in range(len(drone_ids))])
+    return arr, drone_ids
+
+
 def plot_experiment(experiment_dir: str, downsample_hz: float = 0, out_path: str | None = None) -> None:
     """
-    Plot all drone CSVs: position vs time and 2D (x,y) trajectory.
+    Plot all drone CSVs: position vs time; bottom = trajectory (x,y) or position error vs time if position_errors.csv exists.
 
     Args:
         experiment_dir: Path to experiment folder (metadata.json + drone_*.csv).
@@ -79,6 +113,10 @@ def plot_experiment(experiment_dir: str, downsample_hz: float = 0, out_path: str
     if not csv_files:
         raise FileNotFoundError(f"No drone_*.csv in {experiment_dir}")
 
+    position_errors_path = exp / "position_errors.csv"
+    has_errors = position_errors_path.is_file()
+    err_arr, err_drone_ids = load_position_errors(str(position_errors_path)) if has_errors else (np.zeros((0, 1)), [])
+
     min_dt = (1.0 / downsample_hz) if downsample_hz > 0 else 0.0
     all_data = {}
     for p in csv_files:
@@ -88,8 +126,12 @@ def plot_experiment(experiment_dir: str, downsample_hz: float = 0, out_path: str
         all_data[did] = (arr, arr_plot)
 
     n_drones = len(all_data)
-    fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
-    ax_time, ax_xy = axes[0], axes[1]
+    n_rows = 2
+    fig, axes = plt.subplots(n_rows, 1, figsize=(12, 8), sharex=True)
+    if n_rows == 1:
+        axes = [axes]
+    ax_time = axes[0]
+    ax_bottom = axes[1]
 
     colors = plt.cm.tab10(np.linspace(0, 1, max(n_drones, 1)))
 
@@ -102,18 +144,32 @@ def plot_experiment(experiment_dir: str, downsample_hz: float = 0, out_path: str
         ax_time.plot(t, x, "-", color=c, alpha=0.8, label=f"{label} x")
         ax_time.plot(t, y, "--", color=c, alpha=0.6, label=f"{label} y")
         ax_time.plot(t, z, ":", color=c, alpha=0.8, label=f"{label} z")
-        ax_xy.plot(x, y, "-", color=c, label=label)
+        if not has_errors:
+            ax_bottom.plot(x, y, "-", color=c, label=label)
 
     ax_time.set_ylabel("Position (m)")
     ax_time.set_title("Position vs time (x, y, z)")
     ax_time.legend(loc="upper right", fontsize=7, ncol=2)
     ax_time.grid(True, alpha=0.3)
-    ax_xy.set_xlabel("x (m)")
-    ax_xy.set_ylabel("y (m)")
-    ax_xy.set_title("Trajectory (x, y)")
-    ax_xy.legend(loc="upper right", fontsize=8)
-    ax_xy.set_aspect("equal", adjustable="datalim")
-    ax_xy.grid(True, alpha=0.3)
+
+    if has_errors and len(err_arr) > 0 and len(err_drone_ids) > 0:
+        for idx, did in enumerate(err_drone_ids):
+            c = colors[(did - 1) % len(colors)]
+            t_err = err_arr[:, 0]
+            e = err_arr[:, idx + 1]
+            ax_bottom.plot(t_err, e, "-", color=c, alpha=0.8, label=f"drone_{did}")
+        ax_bottom.set_xlabel("Time (s)")
+        ax_bottom.set_ylabel("Position error (m)")
+        ax_bottom.set_title("Position control error vs time")
+        ax_bottom.legend(loc="upper right", fontsize=8)
+        ax_bottom.grid(True, alpha=0.3)
+    else:
+        ax_bottom.set_xlabel("x (m)")
+        ax_bottom.set_ylabel("y (m)")
+        ax_bottom.set_title("Trajectory (x, y)")
+        ax_bottom.legend(loc="upper right", fontsize=8)
+        ax_bottom.set_aspect("equal", adjustable="datalim")
+        ax_bottom.grid(True, alpha=0.3)
     plt.tight_layout()
 
     if out_path:

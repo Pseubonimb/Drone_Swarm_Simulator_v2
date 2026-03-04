@@ -3,6 +3,7 @@ Leader forward-back: leader flies forward → stop → backward → stop.
 
 All drones in POS_HOLD; CoordsMonitor and VelocityMonitor from core; PID from core.
 """
+import json
 import logging
 import os
 import sys
@@ -292,6 +293,78 @@ def _read_webots_step_hz(num_instances: int = 2) -> Optional[float]:
     return min(hz_list) if hz_list else None
 
 
+# Nominal formation spacing (m): desired distance between consecutive drones along Y
+FORMATION_D_STAR_M = 2.0
+
+
+def _distance_3d(pi: Dict[str, float], pj: Dict[str, float]) -> float:
+    """Euclidean distance between two position dicts (x, y, z)."""
+    return (
+        (pi["x"] - pj["x"]) ** 2
+        + (pi["y"] - pj["y"]) ** 2
+        + (pi["z"] - pj["z"]) ** 2
+    ) ** 0.5
+
+
+def _position_control_errors(
+    positions: Dict[int, Dict[str, float]],
+    d_star: float = FORMATION_D_STAR_M,
+) -> Dict[int, float]:
+    """Per-drone position control error (m): distance to desired formation position.
+
+    Leader (id=1): 0. Followers: desired position = leader - (id-1)*d_star along Y (NED).
+    """
+    ids = sorted(positions.keys())
+    leader_id = min(ids)
+    leader_pos = positions.get(leader_id)
+    if not leader_pos:
+        return {i: 0.0 for i in ids}
+    errors: Dict[int, float] = {}
+    for did in ids:
+        if did == leader_id:
+            errors[did] = 0.0
+            continue
+        desired = {
+            "x": leader_pos["x"],
+            "y": leader_pos["y"] - (did - 1) * d_star,
+            "z": leader_pos["z"],
+        }
+        errors[did] = _distance_3d(positions[did], desired)
+    return errors
+
+
+def _formation_metrics_step(
+    positions: Dict[int, Dict[str, float]],
+    collision_radius: float,
+    d_star: float = FORMATION_D_STAR_M,
+) -> tuple:
+    """Compute formation error, min distance and collision flag for current step.
+
+    Returns:
+        (formation_error_max_ij, min_distance_ij, has_collision_this_step)
+        - formation_error_max_ij: max over pairs (i,j) of |d_ij - d*_ij|, d*_ij = d_star * |i - j|
+        - min_distance_ij: minimum pairwise distance (m)
+        - has_collision_this_step: True if any pair has d_ij < 2*collision_radius
+    """
+    ids = sorted(positions.keys())
+    formation_error = 0.0
+    min_dist = float("inf")
+    has_collision = False
+    for i in ids:
+        for j in ids:
+            if i >= j:
+                continue
+            pi, pj = positions[i], positions[j]
+            d_ij = _distance_3d(pi, pj)
+            d_star_ij = d_star * abs(i - j)
+            formation_error = max(formation_error, abs(d_ij - d_star_ij))
+            min_dist = min(min_dist, d_ij)
+            if d_ij < 2 * collision_radius:
+                has_collision = True
+    min_dist = min_dist if min_dist != float("inf") else 0.0
+    return (formation_error, min_dist, has_collision)
+
+
 def _compute_collision_flags(
     positions: Dict[int, Dict[str, float]], collision_radius: float
 ) -> Dict[int, bool]:
@@ -303,11 +376,7 @@ def _compute_collision_flags(
             if i >= j:
                 continue
             pi, pj = positions[i], positions[j]
-            d = (
-                (pi["x"] - pj["x"]) ** 2
-                + (pi["y"] - pj["y"]) ** 2
-                + (pi["z"] - pj["z"]) ** 2
-            ) ** 0.5
+            d = _distance_3d(pi, pj)
             if d < 2 * collision_radius:
                 collision[i] = True
                 collision[j] = True
@@ -321,6 +390,8 @@ def coordinate_exchange_loop(
     collision_radius: float = 0.2,
     log_hz: float = 0.0,
     exchange_loop_hz: float = 50.0,
+    experiment_dir: Optional[str] = None,
+    position_errors_file: Optional[Any] = None,
 ) -> None:
     """Exchange positions between drones, compute collisions, write CSV rows until duration.
 
@@ -328,6 +399,8 @@ def coordinate_exchange_loop(
     CSV is written only when position/attitude changed; log_hz optionally caps write rate.
     Aligning loop rate with SITL avoids flooding the 2D visualizer and reduces lag.
     Reported exchange_hz is the actual loop rate (full period including sleep), not just body time.
+    Formation metrics (max |d_ij - d*|, min distance, steps with collision) are written to
+    experiment_dir/formation_metrics.json on exit.
 
     Args:
         controllers: List of drone controllers (get_my_position, update_other_drone_position).
@@ -336,12 +409,18 @@ def coordinate_exchange_loop(
         collision_radius: Sphere radius for collision detection (m); collision if d < 2*radius.
         log_hz: Max CSV write rate (Hz); 0 = write when position/attitude changed (sync SITL).
         exchange_loop_hz: Main loop rate (Hz); 0 = no limit. Use 50 to match SITL rate.
+        experiment_dir: If set, write formation_metrics.json here on exit.
+        position_errors_file: If set, write one row per step: t, drone_1_err, drone_2_err, ...
     """
     global EXCHANGE_HZ_HISTORY, START_TIME
     last_written: Dict[int, tuple] = {}  # drone_id -> (x, y, z, rx, ry, rz)
     last_csv_log_time = 0.0
     log_period = (1.0 / log_hz) if log_hz > 0 else 0.0
     loop_period = (1.0 / exchange_loop_hz) if exchange_loop_hz > 0 else 0.0
+    # Formation metrics over the run
+    formation_error_max_run = 0.0
+    min_distance_run = float("inf")
+    steps_with_collision = 0
     try:
         while True:
             if duration > 0 and (time.time() - START_TIME) >= duration:
@@ -371,39 +450,60 @@ def coordinate_exchange_loop(
                     _publish_positions(positions, rates=RATES_SHARED)
                 except Exception:
                     pass
-            if experiment_log_files:
+            if experiment_log_files or experiment_dir:
                 now = time.time()
                 t = now - START_TIME
                 rate_ok = log_period <= 0 or (now - last_csv_log_time) >= log_period
                 collision_flags = _compute_collision_flags(
                     positions, collision_radius
                 )
+                # Formation metrics this step
+                formation_err_step, min_dist_step, has_collision_step = (
+                    _formation_metrics_step(positions, collision_radius)
+                )
+                formation_error_max_run = max(
+                    formation_error_max_run, formation_err_step
+                )
+                if min_dist_step < min_distance_run:
+                    min_distance_run = min_dist_step
+                if has_collision_step:
+                    steps_with_collision += 1
+                if position_errors_file:
+                    errs = _position_control_errors(positions)
+                    ids_sorted = sorted(errs.keys())
+                    row = f"{t:.6f}," + ",".join(f"{errs[did]:.6f}" for did in ids_sorted) + "\n"
+                    try:
+                        position_errors_file.write(row)
+                        position_errors_file.flush()
+                    except OSError:
+                        pass
                 wrote_this_iter = False
-                for controller in controllers:
-                    did = controller.config["id"]
-                    pos = positions[did]  # already in common frame (y includes (did-1)*2)
-                    att = attitudes[did]
-                    state = (
-                        pos["x"], pos["y"], pos["z"],
-                        att["rx"], att["ry"], att["rz"],
-                    )
-                    changed = last_written.get(did) != state
-                    if changed and rate_ok:
-                        last_written[did] = state
-                        hc = 1 if collision_flags[did] else 0
-                        write_row(
-                            experiment_log_files[did],
-                            did,
-                            t,
-                            pos["x"],
-                            pos["y"],
-                            pos["z"],
-                            att["rx"],
-                            att["ry"],
-                            att["rz"],
-                            hc,
+                if experiment_log_files:
+                    for controller in controllers:
+                        did = controller.config["id"]
+                        pos = positions[did]  # already in common frame (y includes (did-1)*2)
+                        att = attitudes[did]
+                        state = (
+                            pos["x"], pos["y"], pos["z"],
+                            att["rx"], att["ry"], att["rz"],
                         )
-                        wrote_this_iter = True
+                        changed = last_written.get(did) != state
+                        if changed and rate_ok:
+                            last_written[did] = state
+                            hc = 1 if collision_flags[did] else 0
+                            write_row(
+                                experiment_log_files[did],
+                                did,
+                                t,
+                                pos["x"],
+                                pos["y"],
+                                pos["z"],
+                                att["rx"],
+                                att["ry"],
+                                att["rz"],
+                                hc,
+                            )
+                            wrote_this_iter = True
                 if wrote_this_iter:
                     last_csv_log_time = now
             if loop_period > 0:
@@ -427,6 +527,32 @@ def coordinate_exchange_loop(
                     f.close()
                 except Exception:
                     pass
+        if position_errors_file:
+            try:
+                position_errors_file.close()
+            except Exception:
+                pass
+        if experiment_dir:
+            min_dist_final = (
+                min_distance_run
+                if min_distance_run != float("inf")
+                else None
+            )
+            metrics = {
+                "formation_error_max_m": round(formation_error_max_run, 6),
+                "min_distance_m": (
+                    round(min_dist_final, 6) if min_dist_final is not None else None
+                ),
+                "steps_with_collision": steps_with_collision,
+                "d_star_m": FORMATION_D_STAR_M,
+            }
+            path = os.path.join(experiment_dir, "formation_metrics.json")
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(metrics, f, indent=2)
+                logger.info("Wrote formation metrics to %s", path)
+            except OSError as e:
+                logger.warning("Could not write formation_metrics.json: %s", e)
 
 
 def initialize_drone_parallel(
@@ -548,6 +674,12 @@ def main() -> None:
         args.drones,
         "leader_forward_back",
     )
+    position_errors_path = os.path.join(experiment_dir, "position_errors.csv")
+    position_errors_file = open(position_errors_path, "w")
+    position_errors_file.write(
+        "t," + ",".join(f"drone_{i+1}" for i in range(args.drones)) + "\n"
+    )
+    position_errors_file.flush()
 
     controllers = []
     for config in drones_config:
@@ -575,6 +707,8 @@ def main() -> None:
             "collision_radius": args.collision_radius,
             "log_hz": getattr(args, "log_hz", 0.0),
             "exchange_loop_hz": getattr(args, "exchange_hz", 50.0),
+            "experiment_dir": experiment_dir,
+            "position_errors_file": position_errors_file,
         },
         daemon=True,
     ).start()

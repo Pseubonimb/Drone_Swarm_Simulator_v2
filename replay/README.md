@@ -27,6 +27,24 @@ xhost +local:docker
 
 **Environment:** Set `DISPLAY` (e.g. `:0`) and run `xhost +local:docker` once per session so both containers can use the host X11.
 
+### Option 3: One script — Docker + RViz + GUI (no ROS on host)
+
+If **ROS is not installed on the host**, use this script. It starts the replay container (interactive) and a second container that runs both RViz and the replay GUI; both use ROS inside Docker. You get 3D view in RViz and a control window (play/pause/speed/seek) without installing ROS locally.
+
+```bash
+export DISPLAY=:0
+xhost +local:docker
+
+./scripts/replay-with-rviz-and-gui.sh EXPERIMENT_PATH [RATE]
+```
+
+- **EXPERIMENT_PATH** — path to experiment dir (e.g. `experiments/2026-02-28_18-35-11`).
+- **RATE** — optional speed 0.25–4.0 (default 1.0).
+
+When you close RViz, the script stops the replay container. The GUI window runs in the same container as RViz and closes together with it.
+
+The script uses a custom image `swarm-replay-rviz-gui:noetic` (ROS Noetic + python3-tk). On first run it is built once from `docker/Dockerfile.replay-rviz-gui`; later runs start immediately without installing tkinter in the container.
+
 ---
 
 ## CSV format
@@ -115,6 +133,8 @@ rosrun rviz rviz
 ## Replay with GUI
 
 A small graphical control window (tkinter) publishes to the same ROS topics as above. **Start the replay process with `--interactive` first**, then start the GUI so both use the same ROS master.
+
+**No ROS on host?** Use one script: `./scripts/replay-with-rviz-and-gui.sh EXPERIMENT_PATH [RATE]` — replay, RViz and GUI all run in Docker (see Option 3 above).
 
 ### Launch order (replay with GUI)
 

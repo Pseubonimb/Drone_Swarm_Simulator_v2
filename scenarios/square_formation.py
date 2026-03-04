@@ -26,6 +26,11 @@ logger = logging.getLogger(__name__)
 from core.control import DroneController, PIDRegulator
 from core.mavlink.utils import RC_NEUTRAL
 
+try:
+    from visualizer.position_publisher import publish_positions as _publish_positions
+except ImportError:
+    _publish_positions = None
+
 # Square step commands (roll, pitch, throttle, yaw)
 SQUARE_STEPS = [
     (RC_NEUTRAL, 1700, RC_NEUTRAL, RC_NEUTRAL),  # Back
@@ -248,17 +253,39 @@ def initialize_drone_parallel(
 
 
 def main() -> None:
-    """Parse args (--drones, --duration, --experiment-dir), create controllers, run square pattern.
+    """Parse args, create controllers, run square pattern.
 
-    Duration and experiment-dir are accepted for batch compatibility; currently
-    uses fixed square pattern loop. Number of drones is taken from --drones.
+    Accepts same sync parameters as launcher: --exchange-hz, --control-hz, --log-hz
+    for coordinate exchange rate, control loop rate, and CSV/log write rate.
     """
     parser = argparse.ArgumentParser(description="Square formation (square_pid)")
     parser.add_argument("--drones", type=int, default=5, help="Number of drones (launcher/batch)")
     parser.add_argument("--duration", type=float, default=0, help="Experiment duration (s); 0 = no limit")
     parser.add_argument("--experiment-dir", type=str, default=None, help="Experiment log folder")
+    parser.add_argument(
+        "--control-hz",
+        type=float,
+        default=50.0,
+        help="Control loop rate (Hz); 0 = no limit (default 50)",
+    )
+    parser.add_argument(
+        "--log-hz",
+        type=float,
+        default=0.0,
+        help="Max log/CSV write rate (Hz); 0 = every exchange step (default 0)",
+    )
+    parser.add_argument(
+        "--exchange-hz",
+        type=float,
+        default=50.0,
+        help="Coordinate exchange / sync loop rate (Hz); match SITL (default 50)",
+    )
     args = parser.parse_args()
-    # Use args.drones for config; duration/experiment-dir reserved for future use
+
+    exchange_hz = max(0.0, float(args.exchange_hz))
+    loop_period_sec = (1.0 / exchange_hz) if exchange_hz > 0 else 0.02  # default 50 Hz
+    log_hz = max(0.0, float(args.log_hz))
+
     num_drones = max(1, args.drones)
     DRONES_CONFIG = [
         {"id": i + 1, "udp_port": 14551 + i * 10, "role": "square"}
@@ -290,14 +317,45 @@ def main() -> None:
             )
             t.start()
             square_threads.append(t)
+        last_log_time = 0.0
+        rates_shared: Dict[str, Optional[float]] = {"exchange_hz": exchange_hz if exchange_hz > 0 else None}
         while True:
-            for i, c in enumerate(controllers):
-                if c.logging_enabled and hasattr(c, "logfile"):
-                    vel = c.velocity_monitor.get_velocity()
-                    now = datetime.now()
-                    ts = f"{now.second:02d}.{now.microsecond // 1000:03d}"
-                    c.logfile.write(f"'t': {ts}, {vel}\n")
-            time.sleep(0.0025)
+            t0 = time.time()
+            # Publish positions for 2D visualizer (same NED convention as leader_forward_back)
+            positions: Dict[int, Dict[str, float]] = {}
+            for c in controllers:
+                try:
+                    pos = c.get_my_position()
+                    if pos:
+                        did = c.config["id"]
+                        positions[did] = {
+                            **pos,
+                            "y": pos.get("y", 0) + (did - 1) * 2.0,
+                        }
+                except Exception:
+                    pass
+            if _publish_positions is not None and positions:
+                try:
+                    _publish_positions(positions, rates=rates_shared)
+                except Exception:
+                    pass
+            do_log = log_hz <= 0 or (log_hz > 0 and (t0 - last_log_time) >= (1.0 / log_hz))
+            if do_log:
+                for c in controllers:
+                    if c.logging_enabled and hasattr(c, "logfile") and c.velocity_monitor:
+                        try:
+                            vel = c.velocity_monitor.get_velocity()
+                            now = datetime.now()
+                            ts = f"{now.second:02d}.{now.microsecond // 1000:03d}"
+                            c.logfile.write(f"'t': {ts}, {vel}\n")
+                        except Exception:
+                            pass
+                if log_hz > 0:
+                    last_log_time = t0
+            elapsed = time.time() - t0
+            sleep_sec = loop_period_sec - elapsed
+            if sleep_sec > 0:
+                time.sleep(sleep_sec)
     except KeyboardInterrupt:
         for controller in controllers:
             controller.stop()

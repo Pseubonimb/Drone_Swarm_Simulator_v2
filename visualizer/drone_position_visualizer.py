@@ -61,8 +61,8 @@ def parse_args() -> argparse.Namespace:
         help="Number of last points to show as trail (0 = current only)",
     )
     parser.add_argument(
-        "--interval", type=float, default=0.02,
-        help="Plot update interval in seconds (default 0.02 = 50 Hz; match --exchange-hz for smooth display)",
+        "--interval", type=float, default=0.05,
+        help="Plot update interval in seconds (default 0.05 = 20 Hz; match --exchange-hz for smooth display)",
     )
     return parser.parse_args()
 
