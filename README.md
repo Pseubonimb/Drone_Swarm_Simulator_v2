@@ -17,6 +17,50 @@ Drone_Swarm_Simulator_v2/
 └── docs/                  # Документация исследований (локально)
 ```
 
+## Установка окружения (setup_env.py)
+
+Рекомендуемая установка выполняется на **Linux (Ubuntu)** с правами `sudo`. На Windows скрипт может частично отработать, но окружение для дипломной работы предполагается на Linux.
+
+1. **Клонируйте репозиторий** и перейдите в каталог `Drone_Swarm_Simulator_v2`:
+
+   ```bash
+   git clone <url-репозитория>
+   cd Drone_Swarm_Simulator_v2
+   ```
+
+2. **Запустите скрипт настройки окружения**:
+
+   ```bash
+   python3 setup_env.py
+   ```
+
+   Скрипт делает следующее:
+
+   - устанавливает системные зависимости через `apt` (только на Ubuntu):
+     - `git`, `build-essential`
+     - `python<версия>-dev`, `python<версия>-venv`
+     - `python3-tk` (tkinter для matplotlib)
+     - библиотеки GTK/SDL/картинки/видео для сборки `wxPython`:
+       `libgtk-3-dev`, `libglib2.0-dev`, `libsdl2-dev`, `libjpeg-dev`, `libpng-dev`,
+       `libtiff-dev`, `libnotify-dev`, `freeglut3-dev`,
+       `libgstreamer1.0-dev`, `libgstreamer-plugins-base1.0-dev`,
+       `libwebkit2gtk-4.1-dev`
+   - создаёт виртуальное окружение `../drone_env` (относительно корня проекта)
+   - активирует его и устанавливает Python-зависимости через `pip`:
+     - `pymavlink`, `pexpect`, `empy==3.3.4`, `dronecan`, `setuptools`, `PyYAML`
+     - `numpy`, `matplotlib`, `pyserial`, `future`, `lxml`
+     - `wxPython` (для MAVProxy console) — **сборка может занимать 10–20 минут**
+     - `opencv-python` (для модуля map в MAVProxy)
+   - клонирует `MAVProxy` из GitHub в подкаталог `MAVProxy` рядом с проектом и устанавливает его в режиме editable (`pip install -e`).
+   - добавляет `~/.local/bin` в `PATH` в `~/.bashrc` (на Ubuntu), чтобы бинарники `pip` и `MAVProxy` были доступны из командной строки.
+
+3. **Особенности и рекомендации**:
+
+   - На свежих версиях Ubuntu (например, **Ubuntu 25.10**) пакет `wxPython` может отсутствовать в бинарном виде, поэтому `pip` может собирать его **из исходников** — это нормально, просто требует времени и установленного набора dev-библиотек (см. список выше).
+   - Виртуальное окружение `../drone_env` должно быть создано **на той системе, где вы запускаете симуляции**. Не переносите его целиком с Windows на Linux — создайте новое окружение на Linux с помощью `setup_env.py`.
+   - На Windows часть шагов (apt, обновление `~/.bashrc`) будет пропущена или ограничена, поэтому рекомендованный и поддерживаемый сценарий — запуск `setup_env.py` на Ubuntu и дальнейшая работа в этом окружении.
+
+
 ## Быстрый старт
 
 ```bash
