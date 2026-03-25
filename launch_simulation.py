@@ -36,8 +36,8 @@ SIM_VEHICLE_PATH: str = os.path.join(APM_HOME, "Tools", "autotest", "sim_vehicle
 # Per-drone home: sim_vehicle.py uses -l/--custom-location (lat,lon,alt,heading). We use one base
 # and offset East by (drone_index * 2) m so that in a common NED frame drone 0 is at Y=0, 1 at Y=2, etc.
 # East offset in degrees = meters_east / (111320 * cos(lat_rad)).
-BASE_HOME_LAT = 47.0
-BASE_HOME_LON = 8.0
+BASE_HOME_LAT = 0.0
+BASE_HOME_LON = 0.0
 BASE_HOME_ALT = 0.0
 METERS_PER_DEGREE_EAST = 111320.0 * math.cos(math.radians(BASE_HOME_LAT))
 
@@ -72,10 +72,20 @@ SCENARIOS: List[Tuple[str, str, str, str]] = [
 ]
 
 
+def _close_sitl_log_files(handles) -> None:
+    """Close SITL stdout log handles opened in main(); safe if already closed."""
+    for f in handles:
+        try:
+            f.close()
+        except OSError:
+            pass
+
+
 def start_sitl_only(
     proj_root: str,
     num_drones: int = 2,
     param_file: Optional[str] = None,
+    log_files=None,
 ) -> List[subprocess.Popen]:
     """Start SITL instances without Webots.
 
@@ -83,10 +93,17 @@ def start_sitl_only(
         proj_root: Project root directory path.
         num_drones: Number of drone instances to start.
         param_file: Optional path to ArduPilot parameter file (relative to proj_root).
+        log_files: Open text handles for stdout/stderr (one per drone); length must equal num_drones.
 
     Returns:
         List of started subprocess Popen objects, or empty list on error.
     """
+    if log_files is None:
+        raise ValueError("log_files is required (open SITL logs in main() and pass them in).")
+    if len(log_files) != num_drones:
+        raise ValueError(
+            f"log_files must have length num_drones ({num_drones}), got {len(log_files)}"
+        )
     if not os.path.isfile(SIM_VEHICLE_PATH):
         logger.error("Not found %s; ArduPilot must be at ../ardupilot relative to project.", SIM_VEHICLE_PATH)
         return []
@@ -114,7 +131,13 @@ def start_sitl_only(
         if extra_params:
             args.extend(extra_params)
         logger.info("[SITL] instance=%s, UDP -> 127.0.0.1:%s, custom_location=%s", i, udp_port, home_str)
-        proc = subprocess.Popen(args, cwd=cwd)
+        log_f = log_files[i]
+        proc = subprocess.Popen(
+            args,
+            cwd=cwd,
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+        )
         processes.append(proc)
         time.sleep(5)
     return processes
@@ -124,20 +147,28 @@ def start_sitl_webots(
     proj_root: str,
     num_drones: int = 2,
     param_file: Optional[str] = None,
-) -> Tuple[List[subprocess.Popen], None]:
+    log_files=None,
+) -> List[subprocess.Popen]:
     """Start SITL instances with Webots (webots-python model).
 
     Args:
         proj_root: Project root directory path.
         num_drones: Number of drone instances to start.
         param_file: Optional path to ArduPilot parameter file (relative to proj_root).
+        log_files: Open text handles for stdout/stderr (one per drone); length must equal num_drones.
 
     Returns:
-        Tuple of (list of SITL Popen processes, None placeholder).
+        List of started SITL subprocess Popen objects, or empty list on error.
     """
+    if log_files is None:
+        raise ValueError("log_files is required (open SITL logs in main() and pass them in).")
+    if len(log_files) != num_drones:
+        raise ValueError(
+            f"log_files must have length num_drones ({num_drones}), got {len(log_files)}"
+        )
     if not os.path.isfile(SIM_VEHICLE_PATH):
         logger.error("Not found %s", SIM_VEHICLE_PATH)
-        return [], None
+        return []
     BASE_TCP = 5770
     BASE_UDP = 14551
     p = os.path.join(proj_root, param_file) if param_file else None
@@ -158,15 +189,20 @@ def start_sitl_webots(
             f"--out=127.0.0.1:{tcp_port}",
             f"--out=127.0.0.1:{udp_port}",
             "-l", home_str,
-            "--console",
         ]
         if extra:
             args.extend(extra)
         logger.info("[SITL] instance=%s, TCP=%s, UDP=%s, custom_location=%s", i, tcp_port, udp_port, home_str)
-        proc = subprocess.Popen(args, cwd=cwd)
+        log_f = log_files[i]
+        proc = subprocess.Popen(
+            args,
+            cwd=cwd,
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+        )
         processes.append(proc)
         time.sleep(5)
-    return processes, None
+    return processes
 
 
 def launch_webots(
@@ -322,7 +358,7 @@ Examples:
             if args.scenario
             else SCENARIOS[0]
         )
-        use_2d_visualizer = getattr(args, "with_2d_visualizer", False)
+        use_2d_visualizer = args.with_2d_visualizer
     else:
         use_webots, scenario, num_drones, use_2d_visualizer = run_interactive_menu()
 
@@ -336,20 +372,48 @@ Examples:
         logger.error("Scenario not found: %s", script_path)
         sys.exit(1)
 
+    sitl_log_dir = os.path.join(project_root, "logs", "sitl")
+    os.makedirs(sitl_log_dir, exist_ok=True)
+    sitl_log_basename = "sitl_webots_instance" if use_webots else "sitl_instance"
+    sitl_log_files = []
+    for i in range(num_drones):
+        log_path = os.path.join(sitl_log_dir, f"{sitl_log_basename}_{i}.log")
+        sitl_log_files.append(open(log_path, "w", encoding="utf-8"))
+
     processes = []
     if use_webots:
         webots_proc = launch_webots(project_root, num_drones)
         if webots_proc:
             processes.append(webots_proc)
             time.sleep(5)
-    if use_webots:
-        sitl_procs, _ = start_sitl_webots(project_root, num_drones, args.param_file)
+        sitl_procs = start_sitl_webots(
+            project_root, num_drones, args.param_file, log_files=sitl_log_files
+        )
         processes.extend(sitl_procs)
     else:
-        sitl_procs = start_sitl_only(project_root, num_drones, args.param_file)
+        sitl_procs = start_sitl_only(
+            project_root, num_drones, args.param_file, log_files=sitl_log_files
+        )
         processes.extend(sitl_procs)
 
+    if not sitl_procs:
+        logger.error("[Launcher] SITL did not start (check %s and ../ardupilot).", SIM_VEHICLE_PATH)
+        for p in processes:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+        time.sleep(1)
+        for p in processes:
+            try:
+                p.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                p.kill()
+        _close_sitl_log_files(sitl_log_files)
+        sys.exit(1)
+
     if not processes:
+        _close_sitl_log_files(sitl_log_files)
         sys.exit(1)
 
     logger.info("[Launcher] Waiting for SITL (arm/takeoff)...")
@@ -371,11 +435,11 @@ Examples:
 
     logger.info("[Scenario] Starting: %s", scenario_desc)
     scenario_cmd = [sys.executable, script_rel, "--drones", str(num_drones)]
-    if getattr(args, "duration", 0) > 0:
+    if args.duration > 0:
         scenario_cmd.extend(["--duration", str(args.duration)])
-    if getattr(args, "experiment_dir", None):
+    if args.experiment_dir:
         scenario_cmd.extend(["--experiment-dir", args.experiment_dir])
-    exchange_hz = getattr(args, "exchange_hz", 50.0)
+    exchange_hz = args.exchange_hz
     if exchange_hz > 0:
         scenario_cmd.extend(["--exchange-hz", str(exchange_hz)])
     scenario_proc = subprocess.Popen(
@@ -399,6 +463,7 @@ Examples:
                 p.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 p.kill()
+        _close_sitl_log_files(sitl_log_files)
         sys.exit(0)
 
     signal.signal(signal.SIGINT, shutdown)
