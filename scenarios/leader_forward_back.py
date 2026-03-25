@@ -65,7 +65,7 @@ def move_towards_with_pid(
     roll_pid: Optional[PIDRegulator] = None,
     pitch_pid: Optional[PIDRegulator] = None,
     dt: Optional[float] = None,
-    distance_threshold: float = 0.4,
+    distance_threshold: float = 0.05,
     my_position_common: Optional[Dict[str, float]] = None,
 ) -> None:
     """Move controller toward target using optional PIDs; send neutral if within threshold.
@@ -93,20 +93,20 @@ def move_towards_with_pid(
         rel_pos = controller.coords_monitor.get_relative_position(target_position)
     error_x = rel_pos["x"]
     error_y = rel_pos["y"] - 2
-    distance = (error_x**2 + error_y**2) ** 0.5
-    if distance < distance_threshold:
-        controller.worker.send_rc_override(
-            RC_NEUTRAL,
-            RC_NEUTRAL,
-            RC_NEUTRAL,
-            RC_NEUTRAL,
-            controller=controller,
-        )
-        if roll_pid is not None:
-            roll_pid.reset()
-        if pitch_pid is not None:
-            pitch_pid.reset()
-        return
+    # distance = (error_x**2 + error_y**2) ** 0.5
+    # if error_x < distance_threshold:
+    #     controller.worker.send_rc_override(
+    #         RC_NEUTRAL,
+    #         RC_NEUTRAL,
+    #         RC_NEUTRAL,
+    #         RC_NEUTRAL,
+    #         controller=controller,
+    #     )
+    #     if roll_pid is not None:
+    #         roll_pid.reset()
+    #     if pitch_pid is not None:
+    #         pitch_pid.reset()
+    #     return
     pitch_output = (
         pitch_pid.update(error_x, dt=dt)
         if pitch_pid is not None
@@ -231,11 +231,14 @@ def follower_loop(
                 RATES_SHARED["follower_hz"] = sum(FOLLOWER_HZ_HISTORY) / len(FOLLOWER_HZ_HISTORY)
             leader_pos = other_positions[target_drone_id]
             raw_pos = controller.get_my_position()
-            # Follower position in common NED frame (SITL per-drone home: Y offset (id-1)*2).
+            # Follower position in common NED frame.
+            # Use minus offset so common-frame initial formation is:
+            # drone_1: y=0, drone_2: y=-2, drone_3: y=-4, ...
+            # This matches the target definition desired_y = leader_y - (id-1)*2.
             did = controller.config["id"]
             follower_pos_common = {
                 **raw_pos,
-                "y": raw_pos["y"] + (did - 1) * 2.0,
+                "y": raw_pos["y"] - (did - 1) * 2.0,
             }
             rel_pos = {
                 "x": leader_pos["x"] - follower_pos_common["x"],
@@ -296,6 +299,11 @@ def _read_webots_step_hz(num_instances: int = 2) -> Optional[float]:
 # Nominal formation spacing (m): desired distance between consecutive drones along Y
 FORMATION_D_STAR_M = 2.0
 
+# When True, coordinate_exchange_loop writes extra debug CSVs in the experiment dir:
+# position_errors.csv, position_y_errors.csv, relative_y.csv, raw_positions.csv,
+# common_positions.csv. Default off to reduce I/O and disk use.
+WRITE_EXCHANGE_DEBUG_CSV = True
+
 
 def _distance_3d(pi: Dict[str, float], pj: Dict[str, float]) -> float:
     """Euclidean distance between two position dicts (x, y, z)."""
@@ -331,6 +339,52 @@ def _position_control_errors(
         }
         errors[did] = _distance_3d(positions[did], desired)
     return errors
+
+
+def _position_y_errors(
+    positions: Dict[int, Dict[str, float]],
+    d_star: float = FORMATION_D_STAR_M,
+) -> Dict[int, float]:
+    """Per-drone Y-axis control error (m) in common frame.
+
+    Leader (id=1): 0. Followers: desired Y = leader_y - (id-1)*d_star.
+    Error is defined as (desired_y - current_y), matching follower control sign.
+    """
+    ids = sorted(positions.keys())
+    leader_id = min(ids)
+    leader_pos = positions.get(leader_id)
+    if not leader_pos:
+        return {i: 0.0 for i in ids}
+    errors: Dict[int, float] = {}
+    for did in ids:
+        if did == leader_id:
+            errors[did] = 0.0
+            continue
+        desired_y = leader_pos["y"] - (did - 1) * d_star
+        errors[did] = desired_y - positions[did]["y"]
+    return errors
+
+
+def _relative_y_between_neighbors(
+    positions: Dict[int, Dict[str, float]],
+) -> Dict[int, float]:
+    """Relative Y (m) to previous drone in chain: y_{id-1} - y_{id}.
+
+    For leader (min id), returns 0.0.
+    """
+    ids = sorted(positions.keys())
+    if not ids:
+        return {}
+    rel: Dict[int, float] = {}
+    leader_id = ids[0]
+    rel[leader_id] = 0.0
+    for did in ids[1:]:
+        prev_id = did - 1
+        if prev_id in positions:
+            rel[did] = positions[prev_id]["y"] - positions[did]["y"]
+        else:
+            rel[did] = 0.0
+    return rel
 
 
 def _formation_metrics_step(
@@ -392,6 +446,10 @@ def coordinate_exchange_loop(
     exchange_loop_hz: float = 50.0,
     experiment_dir: Optional[str] = None,
     position_errors_file: Optional[Any] = None,
+    position_y_errors_file: Optional[Any] = None,
+    relative_y_file: Optional[Any] = None,
+    raw_positions_file: Optional[Any] = None,
+    common_positions_file: Optional[Any] = None,
 ) -> None:
     """Exchange positions between drones, compute collisions, write CSV rows until duration.
 
@@ -411,6 +469,14 @@ def coordinate_exchange_loop(
         exchange_loop_hz: Main loop rate (Hz); 0 = no limit. Use 50 to match SITL rate.
         experiment_dir: If set, write formation_metrics.json here on exit.
         position_errors_file: If set, write one row per step: t, drone_1_err, drone_2_err, ...
+        position_y_errors_file: If set, write one row per step with Y-only errors:
+            t, drone_1_y_err, drone_2_y_err, ...
+        relative_y_file: If set, write one row per step with relative Y between
+            neighbors in chain: t, drone_1_rel_y, drone_2_rel_y, ...
+        raw_positions_file: If set, write per-drone raw LOCAL_POSITION_NED rows:
+            t, drone_id, x, y, z
+        common_positions_file: If set, write per-drone common-frame rows (positions[...]):
+            t, drone_id, x, y, z
     """
     global EXCHANGE_HZ_HISTORY, START_TIME
     last_written: Dict[int, tuple] = {}  # drone_id -> (x, y, z, rx, ry, rz)
@@ -428,14 +494,20 @@ def coordinate_exchange_loop(
             t0 = time.time()
             positions = {}
             attitudes = {}
+            raw_positions: Dict[int, Dict[str, float]] = {}
+            need_raw_positions = raw_positions_file is not None
             for controller in controllers:
                 did = controller.config["id"]
                 pos_raw = controller.get_my_position()
-                # Convert to common NED frame: each SITL has its own home (Y offset 0, 2, 4, ... m).
-                # Add (did-1)*2 to y so positions align with SITL per-drone home spacing.
+                if need_raw_positions:
+                    raw_positions[did] = pos_raw
+                # Convert to common NED frame for control/metrics:
+                # each SITL has its own home (Y offset 0, 2, 4, ... m) in launch setup.
+                # Subtract (did-1)*2 so common initial positions are 0, -2, -4, ...
+                # and match desired formation sign in follower control.
                 positions[did] = {
                     **pos_raw,
-                    "y": pos_raw["y"] + (did - 1) * 2.0,
+                    "y": pos_raw["y"] - (did - 1) * 2.0,
                 }
                 attitudes[did] = controller.coords_monitor.get_attitude()
             for controller in controllers:
@@ -454,6 +526,32 @@ def coordinate_exchange_loop(
                 now = time.time()
                 t = now - START_TIME
                 rate_ok = log_period <= 0 or (now - last_csv_log_time) >= log_period
+                if raw_positions_file:
+                    for did in sorted(raw_positions.keys()):
+                        p = raw_positions[did]
+                        try:
+                            raw_positions_file.write(
+                                f"{t:.6f},{did},{p['x']:.6f},{p['y']:.6f},{p['z']:.6f}\n"
+                            )
+                        except OSError:
+                            pass
+                    try:
+                        raw_positions_file.flush()
+                    except OSError:
+                        pass
+                if common_positions_file:
+                    for did in sorted(positions.keys()):
+                        p = positions[did]
+                        try:
+                            common_positions_file.write(
+                                f"{t:.6f},{did},{p['x']:.6f},{p['y']:.6f},{p['z']:.6f}\n"
+                            )
+                        except OSError:
+                            pass
+                    try:
+                        common_positions_file.flush()
+                    except OSError:
+                        pass
                 collision_flags = _compute_collision_flags(
                     positions, collision_radius
                 )
@@ -475,6 +573,32 @@ def coordinate_exchange_loop(
                     try:
                         position_errors_file.write(row)
                         position_errors_file.flush()
+                    except OSError:
+                        pass
+                if position_y_errors_file:
+                    y_errs = _position_y_errors(positions)
+                    ids_sorted = sorted(y_errs.keys())
+                    row = (
+                        f"{t:.6f},"
+                        + ",".join(f"{y_errs[did]:.6f}" for did in ids_sorted)
+                        + "\n"
+                    )
+                    try:
+                        position_y_errors_file.write(row)
+                        position_y_errors_file.flush()
+                    except OSError:
+                        pass
+                if relative_y_file:
+                    rel_y = _relative_y_between_neighbors(positions)
+                    ids_sorted = sorted(rel_y.keys())
+                    row = (
+                        f"{t:.6f},"
+                        + ",".join(f"{rel_y[did]:.6f}" for did in ids_sorted)
+                        + "\n"
+                    )
+                    try:
+                        relative_y_file.write(row)
+                        relative_y_file.flush()
                     except OSError:
                         pass
                 wrote_this_iter = False
@@ -530,6 +654,26 @@ def coordinate_exchange_loop(
         if position_errors_file:
             try:
                 position_errors_file.close()
+            except Exception:
+                pass
+        if position_y_errors_file:
+            try:
+                position_y_errors_file.close()
+            except Exception:
+                pass
+        if relative_y_file:
+            try:
+                relative_y_file.close()
+            except Exception:
+                pass
+        if raw_positions_file:
+            try:
+                raw_positions_file.close()
+            except Exception:
+                pass
+        if common_positions_file:
+            try:
+                common_positions_file.close()
             except Exception:
                 pass
         if experiment_dir:
@@ -674,12 +818,38 @@ def main() -> None:
         args.drones,
         "leader_forward_back",
     )
-    position_errors_path = os.path.join(experiment_dir, "position_errors.csv")
-    position_errors_file = open(position_errors_path, "w")
-    position_errors_file.write(
-        "t," + ",".join(f"drone_{i+1}" for i in range(args.drones)) + "\n"
-    )
-    position_errors_file.flush()
+    position_errors_file = None
+    position_y_errors_file = None
+    relative_y_file = None
+    raw_positions_file = None
+    common_positions_file = None
+    if WRITE_EXCHANGE_DEBUG_CSV:
+        position_errors_path = os.path.join(experiment_dir, "position_errors.csv")
+        position_errors_file = open(position_errors_path, "w")
+        position_errors_file.write(
+            "t," + ",".join(f"drone_{i+1}" for i in range(args.drones)) + "\n"
+        )
+        position_errors_file.flush()
+        position_y_errors_path = os.path.join(experiment_dir, "position_y_errors.csv")
+        position_y_errors_file = open(position_y_errors_path, "w")
+        position_y_errors_file.write(
+            "t," + ",".join(f"drone_{i+1}_y_err" for i in range(args.drones)) + "\n"
+        )
+        position_y_errors_file.flush()
+        relative_y_path = os.path.join(experiment_dir, "relative_y.csv")
+        relative_y_file = open(relative_y_path, "w")
+        relative_y_file.write(
+            "t," + ",".join(f"drone_{i+1}_rel_y" for i in range(args.drones)) + "\n"
+        )
+        relative_y_file.flush()
+        raw_positions_path = os.path.join(experiment_dir, "raw_positions.csv")
+        raw_positions_file = open(raw_positions_path, "w")
+        raw_positions_file.write("t,drone_id,x,y,z\n")
+        raw_positions_file.flush()
+        common_positions_path = os.path.join(experiment_dir, "common_positions.csv")
+        common_positions_file = open(common_positions_path, "w")
+        common_positions_file.write("t,drone_id,x,y,z\n")
+        common_positions_file.flush()
 
     controllers = []
     for config in drones_config:
@@ -709,6 +879,10 @@ def main() -> None:
             "exchange_loop_hz": getattr(args, "exchange_hz", 50.0),
             "experiment_dir": experiment_dir,
             "position_errors_file": position_errors_file,
+            "position_y_errors_file": position_y_errors_file,
+            "relative_y_file": relative_y_file,
+            "raw_positions_file": raw_positions_file,
+            "common_positions_file": common_positions_file,
         },
         daemon=True,
     ).start()
