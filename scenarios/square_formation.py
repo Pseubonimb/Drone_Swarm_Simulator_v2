@@ -1,6 +1,6 @@
 """
 Square formation: drones fly a square pattern with PID braking.
-Imports PIDRegulator, VelocityMonitor, send_rc_override from core.
+Uses DroneController (velocity via get_velocity), PIDRegulator, RC via worker.
 
 Accepts --drones, --duration, --experiment-dir from launcher for batch compatibility;
 currently uses fixed config (e.g. 5 drones). leader_forward_back is the main scenario
@@ -139,9 +139,9 @@ class SquareDroneController(DroneController):
             if dt <= 0:
                 dt = 0.05
             last_update_time = current_time
-            if self.velocity_monitor is None:
+            if self.worker is None:
                 break
-            current_velocity = self.velocity_monitor.get_velocity()
+            current_velocity = self.get_velocity()
             current_x_velocity = current_velocity["vx"]
             current_y_velocity = current_velocity["vy"]
             if (
@@ -342,9 +342,9 @@ def main() -> None:
             do_log = log_hz <= 0 or (log_hz > 0 and (t0 - last_log_time) >= (1.0 / log_hz))
             if do_log:
                 for c in controllers:
-                    if c.logging_enabled and hasattr(c, "logfile") and c.velocity_monitor:
+                    if c.logging_enabled and hasattr(c, "logfile") and c.worker:
                         try:
-                            vel = c.velocity_monitor.get_velocity()
+                            vel = c.get_velocity()
                             now = datetime.now()
                             ts = f"{now.second:02d}.{now.microsecond // 1000:03d}"
                             c.logfile.write(f"'t': {ts}, {vel}\n")

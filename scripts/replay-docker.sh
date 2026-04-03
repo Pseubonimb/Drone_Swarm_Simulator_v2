@@ -66,7 +66,7 @@ docker run -it --rm \
   -v /tmp/.X11-unix:/tmp/.X11-unix \
   -v "${WORKSPACE}:/workspace" \
   --network host \
-  osrf/ros:noetic-desktop-full \
+  osrf/ros:noetic-desktop \
   bash -c '
     source /opt/ros/noetic/setup.bash
     roscore &

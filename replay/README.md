@@ -104,7 +104,7 @@ docker run -it --rm \
   -v /tmp/.X11-unix:/tmp/.X11-unix \
   -v /home/user/Документы/Kursach/Drone_Swarm_Simulator_v2:/workspace \
   --network host \
-  osrf/ros:noetic-desktop-full \
+  osrf/ros:noetic-desktop \
   bash
 ```
 

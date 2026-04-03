@@ -19,7 +19,7 @@ class PIDRegulator:
         kd: float = 0.0,
         integral_limit: float = 1000.0,
         output_limit: float = 500.0,
-        derivative_alpha: float = 0.7,
+        derivative_alpha: float = 0,
     ) -> None:
         """
         Initialize the PID regulator.

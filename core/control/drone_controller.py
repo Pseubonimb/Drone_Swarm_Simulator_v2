@@ -1,9 +1,9 @@
 """
-Shared DroneController: MAVLinkWorker, CoordsMonitor, VelocityMonitor, RC keepalive.
+Shared DroneController: MAVLinkWorker, NED/attitude/velocity reads, RC keepalive.
 
 All pymavlink access goes through the worker (thread-safe). Scenarios import this
 class and pass scenario-specific init_steps to initialize(). Algorithm-specific
-logic (e.g. move_towards_with_pid, move_with_pid_braking) stays in scenarios.
+logic (e.g. FollowerPIDPursuit in leader_forward_back, move_with_pid_braking) stays in scenarios.
 """
 
 import os
@@ -13,12 +13,14 @@ from typing import Any, Dict, List, Optional
 
 from core.mavlink.utils import RC_NEUTRAL
 from core.mavlink.worker import MAVLinkWorker
-from core.monitors.coords_monitor import CoordsMonitor
-from core.monitors.velocity_monitor import VelocityMonitor
+
+_DEFAULT_POSITION: Dict[str, float] = {"x": 0.0, "y": 0.0, "z": 0.0}
+_DEFAULT_ATTITUDE: Dict[str, float] = {"rx": 0.0, "ry": 0.0, "rz": 0.0}
+_DEFAULT_VELOCITY: Dict[str, float] = {"vx": 0.0, "vy": 0.0, "vz": 0.0}
 
 
 class DroneController:
-    """Controller for one drone: MAVLinkWorker, monitors, RC keepalive. Thread-safe."""
+    """Controller for one drone: MAVLinkWorker, state getters, RC keepalive. Thread-safe."""
 
     def __init__(
         self,
@@ -35,8 +37,6 @@ class DroneController:
         """
         self.config: Dict[str, Any] = config
         self.worker: Optional[MAVLinkWorker] = None
-        self.coords_monitor: Optional[CoordsMonitor] = None
-        self.velocity_monitor: Optional[VelocityMonitor] = None
         self.other_drones_positions: Dict[int, Dict[str, float]] = {}
         self.lock: threading.Lock = threading.Lock()
         self.logging_enabled: bool = logging_enabled
@@ -57,12 +57,10 @@ class DroneController:
         self.rc_channels_lock = threading.Lock()
 
     def connect(self) -> None:
-        """Create MAVLinkWorker, start it, and create CoordsMonitor and VelocityMonitor."""
+        """Create MAVLinkWorker and start its dedicated I/O thread."""
         conn_str = f'udp:127.0.0.1:{self.config["udp_port"]}'
         self.worker = MAVLinkWorker(conn_str, self.config["id"])
         self.worker.start()
-        self.coords_monitor = CoordsMonitor(self.worker)
-        self.velocity_monitor = VelocityMonitor(self.worker)
 
     def initialize(self, init_steps: List[Dict[str, Any]]) -> None:
         """Run init sequence (arm, takeoff, set mode, etc.) via worker.
@@ -101,13 +99,43 @@ class DroneController:
         Returns:
             Dict with keys 'x', 'y', 'z' (meters in NED). Defaults to origin if unavailable.
         """
-        if self.coords_monitor is None:
-            if self.worker:
-                pos = self.worker.get_position()
-                if pos is not None:
-                    return {"x": pos["x"], "y": pos["y"], "z": pos["z"]}
-            return {"x": 0.0, "y": 0.0, "z": 0.0}
-        return self.coords_monitor.get_position()
+        if self.worker is None:
+            return dict(_DEFAULT_POSITION)
+        pos = self.worker.get_position()
+        if pos is None:
+            return dict(_DEFAULT_POSITION)
+        return {"x": pos["x"], "y": pos["y"], "z": pos["z"]}
+
+    def get_attitude(self) -> Dict[str, float]:
+        """Return current Euler angles (roll, pitch, yaw) in radians as rx, ry, rz."""
+        if self.worker is None:
+            return dict(_DEFAULT_ATTITUDE)
+        att = self.worker.get_attitude()
+        if att is None:
+            return dict(_DEFAULT_ATTITUDE)
+        return {"rx": att["rx"], "ry": att["ry"], "rz": att["rz"]}
+
+    def get_velocity(self) -> Dict[str, float]:
+        """Return current NED velocity (vx, vy, vz) in m/s from LOCAL_POSITION_NED cache."""
+        if self.worker is None:
+            return dict(_DEFAULT_VELOCITY)
+        pos = self.worker.get_position()
+        if pos is None:
+            return dict(_DEFAULT_VELOCITY)
+        return {
+            "vx": pos.get("vx", 0.0),
+            "vy": pos.get("vy", 0.0),
+            "vz": pos.get("vz", 0.0),
+        }
+
+    def get_relative_position(self, target_position: Dict[str, float]) -> Dict[str, float]:
+        """Relative position to target (target - self) in meters (NED x, y, z)."""
+        pos = self.get_position()
+        return {
+            "x": target_position["x"] - pos["x"],
+            "y": target_position["y"] - pos["y"],
+            "z": target_position["z"] - pos["z"],
+        }
 
     def get_my_position(self) -> Dict[str, float]:
         """Return this drone's position; optionally log to file when logging_enabled.
@@ -140,7 +168,7 @@ class DroneController:
             return {k: dict(v) for k, v in self.other_drones_positions.items()}
 
     def stop(self) -> None:
-        """Send neutral RC, command LAND via worker, stop monitors and worker."""
+        """Send neutral RC, command LAND via worker, then stop worker."""
         if self.worker:
             self.worker.send_rc_override(
                 RC_NEUTRAL,
@@ -150,10 +178,6 @@ class DroneController:
                 controller=self,
             )
             self.worker.send_set_mode(9)  # LAND
-        if self.coords_monitor:
-            self.coords_monitor.stop()
-        if self.velocity_monitor:
-            self.velocity_monitor.stop()
         if self.logging_enabled and self.logfile:
             try:
                 self.logfile.close()

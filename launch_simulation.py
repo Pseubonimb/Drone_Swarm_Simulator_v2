@@ -7,6 +7,8 @@ Usage:
   python launch_simulation.py --help
   python launch_simulation.py -s -c leader_forward_back   # SITL-only, no 2D visualizer
   python launch_simulation.py -s -c leader_forward_back --with-2d-visualizer   # SITL + 2D visualizer
+  python launch_simulation.py -s -c leader_forward_back --with-2d-visualizer \\
+      --viz-fixed-axes --viz-xlim -40 40 --viz-ylim -10 50   # fixed matplotlib window (NED m)
 
 Simulation modes:
   --webots, -w      Webots 3D + SITL
@@ -340,12 +342,46 @@ Examples:
         help="Start 2D matplotlib visualizer subprocess before the scenario.",
     )
     parser.add_argument(
+        "--viz-fixed-axes",
+        action="store_true",
+        help=(
+            "With --with-2d-visualizer: do not auto pan/zoom the plot; "
+            "pass --fixed-axes to the visualizer (optional --viz-xlim / --viz-ylim)."
+        ),
+    )
+    parser.add_argument(
+        "--viz-xlim",
+        nargs=2,
+        type=float,
+        metavar=("MIN", "MAX"),
+        default=None,
+        help="North (X) limits in meters for the 2D visualizer when --viz-fixed-axes is set.",
+    )
+    parser.add_argument(
+        "--viz-ylim",
+        nargs=2,
+        type=float,
+        metavar=("MIN", "MAX"),
+        default=None,
+        help="East (Y) limits in meters for the 2D visualizer when --viz-fixed-axes is set.",
+    )
+    parser.add_argument(
         "--exchange-hz",
         type=float,
         default=50.0,
         help=(
             "Coordinate exchange loop rate (Hz); match SITL position stream. "
             "Passed to scenario (default 50)."
+        ),
+    )
+    parser.add_argument(
+        "--ki-pitch",
+        type=float,
+        default=None,
+        metavar="K",
+        help=(
+            "leader_forward_back: follower pitch-axis I gain (--ki-pitch to scenario). "
+            "Try 0.03–0.1 to reduce steady-state X gap; roll keeps --ki (default 0)."
         ),
     )
     args = parser.parse_args()
@@ -422,8 +458,19 @@ Examples:
     if use_2d_visualizer:
         visualizer_script = os.path.join(project_root, "visualizer", "drone_position_visualizer.py")
         if os.path.isfile(visualizer_script):
+            viz_cmd = [sys.executable, "visualizer/drone_position_visualizer.py"]
+            if args.viz_fixed_axes:
+                viz_cmd.append("--fixed-axes")
+                if args.viz_xlim is not None:
+                    viz_cmd.extend(
+                        ["--xlim", str(args.viz_xlim[0]), str(args.viz_xlim[1])]
+                    )
+                if args.viz_ylim is not None:
+                    viz_cmd.extend(
+                        ["--ylim", str(args.viz_ylim[0]), str(args.viz_ylim[1])]
+                    )
             visualizer_proc = subprocess.Popen(
-                [sys.executable, "visualizer/drone_position_visualizer.py"],
+                viz_cmd,
                 cwd=project_root,
                 stdout=sys.stdout,
                 stderr=sys.stderr,
@@ -442,6 +489,11 @@ Examples:
     exchange_hz = args.exchange_hz
     if exchange_hz > 0:
         scenario_cmd.extend(["--exchange-hz", str(exchange_hz)])
+    if args.ki_pitch is not None:
+        if scenario[0] == "leader_forward_back":
+            scenario_cmd.extend(["--ki-pitch", str(args.ki_pitch)])
+        else:
+            logger.warning("[Launcher] --ki-pitch applies only to leader_forward_back; ignoring.")
     scenario_proc = subprocess.Popen(
         scenario_cmd,
         cwd=scenario_cwd,

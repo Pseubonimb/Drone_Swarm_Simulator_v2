@@ -101,8 +101,4 @@ python replay/replay_rviz.py --experiment experiments/exp_1 --rate 1.0
 
 - Python 3.10+, pymavlink, ArduPilot SITL (клон в `../ardupilot` по желанию).
 - Для replay: ROS (например Noetic), `rospy`.
-- Виртуальное окружение: `../drone_env` (относительно проекта).
-
-## Лицензия и дипломная работа
-
-Документация в `docs/` предназначена для дипломной работы и хранится локально (не публикуется в репозитории).
+- Виртуальное окружение: `drone_env/`.

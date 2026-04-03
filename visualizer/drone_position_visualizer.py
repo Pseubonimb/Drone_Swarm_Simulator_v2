@@ -3,7 +3,7 @@
 Real-time 2D drone position visualizer (any number of drones).
 
 Receives NED coordinates via UDP from scenarios (via position_publisher).
-Coordinates match CoordsMonitor (x=North, y=East, z=Down). Drones appear on the
+Same NED convention as scenarios / DroneController (x=North, y=East, z=Down). Drones appear on the
 plot as they appear in the stream.
 
 Run:
@@ -63,6 +63,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--interval", type=float, default=0.05,
         help="Plot update interval in seconds (default 0.05 = 20 Hz; match --exchange-hz for smooth display)",
+    )
+    parser.add_argument(
+        "--fixed-axes",
+        action="store_true",
+        help=(
+            "Keep X/Y data limits fixed (no auto pan/zoom). "
+            "Use --xlim / --ylim or defaults -30..30 m on both axes."
+        ),
+    )
+    parser.add_argument(
+        "--xlim",
+        nargs=2,
+        type=float,
+        metavar=("MIN", "MAX"),
+        default=None,
+        help="North (X) axis limits in meters when --fixed-axes is set (default: -30 30).",
+    )
+    parser.add_argument(
+        "--ylim",
+        nargs=2,
+        type=float,
+        metavar=("MIN", "MAX"),
+        default=None,
+        help="East (Y) axis limits in meters when --fixed-axes is set (default: -30 30).",
     )
     return parser.parse_args()
 
@@ -160,13 +184,23 @@ class PositionReceiver:
             return self.rates.copy()
 
 
-def run_visualizer(port: int, trail: int, interval: float) -> None:
+def run_visualizer(
+    port: int,
+    trail: int,
+    interval: float,
+    fixed_axes: bool = False,
+    xlim_fixed: Optional[Tuple[float, float]] = None,
+    ylim_fixed: Optional[Tuple[float, float]] = None,
+) -> None:
     """Run the matplotlib window and animation loop.
 
     Args:
         port: UDP port to listen on for position updates.
         trail: Number of last points to show as trail (0 = current only).
         interval: Plot update interval in seconds.
+        fixed_axes: If True, keep ``xlim``/``ylim`` fixed (no shifting with drone motion).
+        xlim_fixed: North-axis limits when ``fixed_axes`` is True; default (-30, 30).
+        ylim_fixed: East-axis limits when ``fixed_axes`` is True; default (-30, 30).
     """
     if not HAS_MATPLOTLIB:
         logger.error("matplotlib required. Install: pip install matplotlib")
@@ -181,9 +215,15 @@ def run_visualizer(port: int, trail: int, interval: float) -> None:
     fig, (ax, ax_rates) = plt.subplots(2, 1, figsize=(9, 9), gridspec_kw={"height_ratios": [3, 1]})
     ax.set_xlabel("X (m, North, NED)")
     ax.set_ylabel("Y (m, East, NED)")
-    ax.set_title("Drone positions (real-time X–Y)")
+    title_suffix = " (fixed axes)" if fixed_axes else ""
+    ax.set_title(f"Drone positions (real-time X–Y){title_suffix}")
     ax.grid(True, alpha=0.2)
     ax.set_aspect("equal", adjustable="box")
+    if fixed_axes:
+        xl = xlim_fixed if xlim_fixed is not None else (-30.0, 30.0)
+        yl = ylim_fixed if ylim_fixed is not None else (-30.0, 30.0)
+        ax.set_xlim(xl[0], xl[1])
+        ax.set_ylim(yl[0], yl[1])
     ax_rates.set_axis_off()
     rates_text = ax_rates.text(
         0.5, 0.5, "", transform=ax_rates.transAxes, fontsize=10,
@@ -259,7 +299,7 @@ def run_visualizer(port: int, trail: int, interval: float) -> None:
             handles = [lines[did] for did in sorted(lines.keys())]
             labels = [label_for_drone(did) for did in sorted(lines.keys())]
             ax.legend(handles, labels, loc="upper left", fontsize=9)
-        if all_x and all_y:
+        if not fixed_axes and all_x and all_y:
             margin = 2.0
             x_min, x_max = min(all_x) - margin, max(all_x) + margin
             y_min, y_max = min(all_y) - margin, max(all_y) + margin
@@ -293,8 +333,22 @@ def main() -> None:
     """Entry point: parse args, configure logging, run visualizer until Ctrl+C."""
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+    xlim_f: Optional[Tuple[float, float]] = None
+    ylim_f: Optional[Tuple[float, float]] = None
+    if args.fixed_axes:
+        if args.xlim is not None:
+            xlim_f = (float(args.xlim[0]), float(args.xlim[1]))
+        if args.ylim is not None:
+            ylim_f = (float(args.ylim[0]), float(args.ylim[1]))
     try:
-        run_visualizer(args.port, args.trail, args.interval)
+        run_visualizer(
+            args.port,
+            args.trail,
+            args.interval,
+            fixed_axes=args.fixed_axes,
+            xlim_fixed=xlim_f,
+            ylim_fixed=ylim_f,
+        )
     except KeyboardInterrupt:
         logger.info("Visualizer stopped.")
 
