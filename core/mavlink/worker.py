@@ -11,11 +11,18 @@ import logging
 import queue
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from pymavlink import mavutil
 
 logger = logging.getLogger(__name__)
+
+# Main thread must not call recv_match / send on mavutil after the worker thread starts;
+# TCP links are especially sensitive to split-thread use.
+
+# Cap recv_msg drain per outer loop iteration so RC/command queue cannot starve indefinitely.
+_MAX_RECV_DRAIN_PER_ITER = 512
+_DEFAULT_TELEMETRY_HZ = 50
 
 
 class MAVLinkWorker:
@@ -44,17 +51,141 @@ class MAVLinkWorker:
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._master: Any = None
+        self._bootstrap_ready = threading.Event()
+        self._bootstrap_error: Optional[BaseException] = None
 
     def start(self) -> None:
-        """Connect to the vehicle and start the single MAVLink thread."""
+        """Connect (in worker thread), wait for HEARTBEAT, then run the I/O loop."""
         if self._running:
             return
-        self._master = mavutil.mavlink_connection(self.connection_string)
-        self._master.wait_heartbeat()
-        self._running = True
-        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        if self._thread is not None and self._thread.is_alive():
+            return
+
+        self._bootstrap_ready.clear()
+        self._bootstrap_error = None
+        self._thread = threading.Thread(target=self._bootstrap_and_run, daemon=True)
         self._thread.start()
+
+        connect_timeout = 120.0
+        if not self._bootstrap_ready.wait(timeout=connect_timeout):
+            self._running = False
+            self._thread.join(timeout=3.0)
+            self._thread = None
+            raise TimeoutError(
+                f"MAVLink worker bootstrap timeout for drone {self.drone_id} "
+                f"({self.connection_string})"
+            )
+        if self._bootstrap_error is not None:
+            err = self._bootstrap_error
+            self._thread.join(timeout=3.0)
+            self._thread = None
+            raise err
+
         logger.info("MAVLinkWorker started for drone %s", self.drone_id)
+
+    def _bootstrap_and_run(self) -> None:
+        """Worker thread only: mavlink_connection, wait_heartbeat, then _run_loop."""
+        conn_kw: Dict[str, Union[int, bool]] = {}
+        is_tcp = self.connection_string.startswith("tcp:")
+        if is_tcp:
+            conn_kw["retries"] = 25
+        hb_timeout = 90.0 if is_tcp else None
+        try:
+            self._master = mavutil.mavlink_connection(
+                self.connection_string, **conn_kw
+            )
+            hb = self._master.wait_heartbeat(blocking=True, timeout=hb_timeout)
+            if hb is None:
+                logger.error(
+                    "Drone %s: no HEARTBEAT on %s (timeout=%s)",
+                    self.drone_id,
+                    self.connection_string,
+                    hb_timeout,
+                )
+                raise TimeoutError(
+                    f"MAVLink HEARTBEAT timeout for drone {self.drone_id} "
+                    f"({self.connection_string})"
+                )
+        except BaseException as exc:
+            self._bootstrap_error = exc
+            self._close_master_safe()
+            self._bootstrap_ready.set()
+            return
+
+        try:
+            self._prime_telemetry_streams(hz=_DEFAULT_TELEMETRY_HZ)
+        except Exception as exc:
+            logger.warning(
+                "Drone %s: telemetry stream prime failed (continuing): %s",
+                self.drone_id,
+                exc,
+            )
+
+        self._running = True
+        self._bootstrap_ready.set()
+        try:
+            self._run_loop()
+        finally:
+            self._running = False
+            self._close_master_safe()
+
+    def _close_master_safe(self) -> None:
+        try:
+            if self._master is not None and hasattr(self._master, "close"):
+                self._master.close()
+        except Exception:
+            pass
+        self._master = None
+
+    def _prime_telemetry_streams(self, hz: int = _DEFAULT_TELEMETRY_HZ) -> None:
+        """Request position/attitude streams early (SITL direct TCP often needs legacy + interval)."""
+        if self._master is None:
+            return
+        m = self._master
+        ts, tc = m.target_system, m.target_component
+        rate = max(1, min(50, int(hz)))
+        interval_us = max(1, int(1e6 / rate))
+        # Legacy REQUEST_DATA_STREAM: ArduPilot still maps POSITION -> LOCAL_POSITION*, etc.
+        m.mav.request_data_stream_send(
+            ts,
+            tc,
+            mavutil.mavlink.MAV_DATA_STREAM_POSITION,
+            rate,
+            1,
+        )
+        m.mav.request_data_stream_send(
+            ts,
+            tc,
+            mavutil.mavlink.MAV_DATA_STREAM_EXTRA1,
+            rate,
+            1,
+        )
+        m.mav.command_long_send(
+            ts,
+            tc,
+            mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+            0,
+            mavutil.mavlink.MAVLINK_MSG_ID_LOCAL_POSITION_NED,
+            interval_us,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+        m.mav.command_long_send(
+            ts,
+            tc,
+            mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+            0,
+            mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE,
+            interval_us,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
 
     def stop(self) -> None:
         """Stop the MAVLink thread. Safe to call from any thread."""
@@ -75,15 +206,22 @@ class MAVLinkWorker:
             except queue.Empty:
                 pass
 
-            # Read incoming messages (non-blocking)
-            msg = self._master.recv_match(
-                type=["LOCAL_POSITION_NED", "ATTITUDE"],
-                blocking=False,
-                timeout=0.01,
-            )
-            if msg is not None and msg.get_type() != "BAD_DATA":
-                with self._state_lock:
-                    if msg.get_type() == "LOCAL_POSITION_NED":
+            # Drain inbound buffer via recv_msg (all types); update pose/attitude when seen.
+            drained = 0
+            while (
+                self._running
+                and self._master
+                and drained < _MAX_RECV_DRAIN_PER_ITER
+            ):
+                msg = self._master.recv_msg()
+                if msg is None:
+                    break
+                drained += 1
+                mt = msg.get_type()
+                if mt == "BAD_DATA":
+                    continue
+                if mt == "LOCAL_POSITION_NED":
+                    with self._state_lock:
                         self._last_position = {
                             "x": msg.x,
                             "y": msg.y,
@@ -92,7 +230,8 @@ class MAVLinkWorker:
                             "vy": getattr(msg, "vy", 0.0),
                             "vz": getattr(msg, "vz", 0.0),
                         }
-                    elif msg.get_type() == "ATTITUDE":
+                elif mt == "ATTITUDE":
+                    with self._state_lock:
                         self._last_attitude = {
                             "rx": msg.roll,
                             "ry": msg.pitch,

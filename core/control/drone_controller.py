@@ -9,7 +9,7 @@ logic (e.g. FollowerPIDPursuit in leader_forward_back, move_with_pid_braking) st
 import os
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from core.mavlink.utils import RC_NEUTRAL
 from core.mavlink.worker import MAVLinkWorker
@@ -17,6 +17,9 @@ from core.mavlink.worker import MAVLinkWorker
 _DEFAULT_POSITION: Dict[str, float] = {"x": 0.0, "y": 0.0, "z": 0.0}
 _DEFAULT_ATTITUDE: Dict[str, float] = {"rx": 0.0, "ry": 0.0, "rz": 0.0}
 _DEFAULT_VELOCITY: Dict[str, float] = {"vx": 0.0, "vy": 0.0, "vz": 0.0}
+
+if TYPE_CHECKING:
+    from core.network import CoordExchangeManager
 
 
 class DroneController:
@@ -31,7 +34,8 @@ class DroneController:
         """Initialize controller with config and optional file logging.
 
         Args:
-            config: Dict with 'id', 'udp_port', 'role'.
+            config: Dict with 'id', 'role', and either 'udp_port' (MAVProxy UDP out) or
+                'mavlink_connection' (full pymavlink URI, e.g. tcp:127.0.0.1:5760).
             logging_enabled: If True, write position logs to log_dir/drone_<id>_log.txt.
             log_dir: Directory for log files when logging_enabled is True.
         """
@@ -56,9 +60,32 @@ class DroneController:
         }
         self.rc_channels_lock = threading.Lock()
 
+    @classmethod
+    def start_swarm_coord_exchange(
+        cls,
+        controllers: List["DroneController"],
+        **kwargs: Any,
+    ) -> "CoordExchangeManager":
+        """Start multi-drone position exchange in a background thread.
+
+        Wraps ``CoordExchangeManager`` so scenarios only call this one entry point.
+        Accepts the same keyword arguments as ``CoordExchangeManager`` (rates, noise,
+        ``noise_dict``, CSV paths, ``on_step``, etc.).
+
+        Returns:
+            Running manager; call ``stop()`` on shutdown if you need a clean join.
+        """
+        from core.network import CoordExchangeManager
+
+        mgr = CoordExchangeManager(controllers, **kwargs)
+        mgr.start()
+        return mgr
+
     def connect(self) -> None:
         """Create MAVLinkWorker and start its dedicated I/O thread."""
-        conn_str = f'udp:127.0.0.1:{self.config["udp_port"]}'
+        conn_str = self.config.get("mavlink_connection")
+        if not conn_str:
+            conn_str = f'udp:127.0.0.1:{self.config["udp_port"]}'
         self.worker = MAVLinkWorker(conn_str, self.config["id"])
         self.worker.start()
 

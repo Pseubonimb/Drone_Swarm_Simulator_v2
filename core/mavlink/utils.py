@@ -9,6 +9,16 @@ from pymavlink import mavutil
 # Neutral PWM value for RC channels (roll, pitch, throttle, yaw).
 RC_NEUTRAL: int = 1500
 
+# ArduPilot SITL TCP (sim_vehicle default; no MAVProxy): instance i -> 5760 + 10*i
+SITL_TCP_BASE_PORT: int = 5760
+SITL_TCP_INSTANCE_STRIDE: int = 10
+
+
+def sitl_tcp_connection_string(instance_index: int) -> str:
+    """MAVLink connection string for SITL instance ``instance_index`` (0-based)."""
+    port = SITL_TCP_BASE_PORT + SITL_TCP_INSTANCE_STRIDE * instance_index
+    return f"tcp:127.0.0.1:{port}"
+
 
 def send_rc_override(
     drone: Any,
