@@ -4,7 +4,8 @@ Batch runner for Drone Swarm Simulator v2: runs multiple experiments in sequence
 
 Each run invokes launch_simulation.py in subprocess with SITL-only mode,
 distinct experiment directory, and the same scenario/drones/duration.
-Use from project root; no hardcoded absolute paths.
+With ``--batch-id``, all runs go under ``experiments/<yyyy-mm-dd_hh-mm-ss>/`` so
+repeated batches do not overwrite prior data. Use from project root; no hardcoded absolute paths.
 """
 
 import argparse
@@ -12,6 +13,7 @@ import json
 import os
 import subprocess
 import sys
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 project_root: str = os.path.dirname(os.path.abspath(__file__))
@@ -97,23 +99,39 @@ Examples:
         "--batch-id",
         type=str,
         default=None,
-        help="Optional batch identifier; if set, dirs are experiments/batch_<id>_run_<run_id>",
+        help=(
+            "Optional batch identifier; if set, dirs are "
+            "experiments/<yyyy-mm-dd_hh-mm-ss>/batch_<id>_run_<run_id> (unique per invocation)."
+        ),
     )
     return parser.parse_args()
 
 
-def build_experiment_dir(run_id: int, batch_id: Optional[str]) -> str:
+def _batch_session_stamp() -> str:
+    """Folder name under experiments/ for one batch series (same format as YAML batch in launcher)."""
+    return datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+
+def build_experiment_dir(
+    run_id: int, batch_id: Optional[str], session_stamp: Optional[str]
+) -> str:
     """Return experiment directory name (relative to project root).
 
     Args:
         run_id: One-based run index.
         batch_id: Optional batch identifier; if set, name uses batch_<id>_run_<run_id>.
+        session_stamp: Required when ``batch_id`` is set; timestamp folder under ``experiments/``.
 
     Returns:
-        Path relative to project root, e.g. experiments/exp_1 or experiments/batch_my_batch_run_1.
+        Path relative to project root, e.g. experiments/exp_1 or
+        experiments/2026-04-07_12-00-00/batch_my_batch_run_1.
     """
-    rel = f"exp_{run_id}" if not batch_id else f"batch_{batch_id}_run_{run_id}"
-    return os.path.join("experiments", rel)
+    if not batch_id:
+        return os.path.join("experiments", f"exp_{run_id}")
+    assert session_stamp is not None
+    return os.path.join(
+        "experiments", session_stamp, f"batch_{batch_id}_run_{run_id}"
+    )
 
 
 def run_single(
@@ -122,6 +140,7 @@ def run_single(
     drones: int,
     duration: float,
     batch_id: Optional[str],
+    session_stamp: Optional[str],
 ) -> tuple[int, str]:
     """Invoke launch_simulation.py once for the given run and validate output.
 
@@ -131,12 +150,13 @@ def run_single(
         drones: Number of drones per run.
         duration: Experiment duration in seconds.
         batch_id: Optional batch identifier for experiment directory naming.
+        session_stamp: Timestamp folder when ``batch_id`` is set.
 
     Returns:
         Tuple of (exit_code, experiment_dir). exit_code 0 only if subprocess
         and output validation (metadata.json + drone_*.csv) pass.
     """
-    experiment_dir = build_experiment_dir(run_id, batch_id)
+    experiment_dir = build_experiment_dir(run_id, batch_id, session_stamp)
     cmd: List[str] = [
         sys.executable,
         LAUNCH_SCRIPT,
@@ -165,7 +185,7 @@ def main() -> None:
     """Parse config, run each experiment in sequence, validate output, write index.
 
     Runs launch_simulation.py in a subprocess for each run; validates presence of
-    metadata.json and drone_*.csv. If --batch-id is set, writes batch_<id>_runs_index.json.
+    metadata.json and drone_*.csv.     If --batch-id is set, writes batch_<id>_runs_index.json under the same session folder.
     Exits with code 1 if launcher not found or any run fails.
     """
     args = parse_args()
@@ -173,6 +193,10 @@ def main() -> None:
         print(f"Error: launcher not found: {LAUNCH_SCRIPT}")
         sys.exit(1)
     os.makedirs(EXPERIMENTS_DIR, exist_ok=True)
+    session_stamp: Optional[str] = _batch_session_stamp() if args.batch_id else None
+    if session_stamp:
+        os.makedirs(os.path.join(EXPERIMENTS_DIR, session_stamp), exist_ok=True)
+        print(f"[Batch] Session directory: experiments/{session_stamp}")
     failed = 0
     index: List[Dict[str, Any]] = []
     for run_id in range(1, args.runs + 1):
@@ -182,6 +206,7 @@ def main() -> None:
             drones=args.drones,
             duration=args.duration,
             batch_id=args.batch_id,
+            session_stamp=session_stamp,
         )
         if code != 0:
             failed += 1
@@ -197,9 +222,11 @@ def main() -> None:
                     "batch_id": args.batch_id,
                 }
             )
-    if args.batch_id and index:
+    if args.batch_id and index and session_stamp:
         index_path = os.path.join(
-            EXPERIMENTS_DIR, f"batch_{args.batch_id}_runs_index.json"
+            EXPERIMENTS_DIR,
+            session_stamp,
+            f"batch_{args.batch_id}_runs_index.json",
         )
         with open(index_path, "w", encoding="utf-8") as f:
             json.dump(index, f, indent=2)

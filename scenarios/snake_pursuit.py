@@ -1,7 +1,6 @@
 """
-Leader forward-back: leader flies forward → stop → backward → stop.
-
-All drones in POS_HOLD; NED/attitude via DroneController; PID from core.
+Snake pursuit: leader holds POS_HOLD and biases roll for steady +Y motion (NED, East);
+followers chase predecessor in common NED (chain). Separate module state from leader_forward_back.
 """
 
 import logging
@@ -12,7 +11,6 @@ import time
 from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
 
-# Ensure project root is on path when run as script (e.g. python scenarios/leader_forward_back.py)
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
@@ -24,7 +22,7 @@ from core.mavlink.utils import RC_NEUTRAL, sitl_tcp_connection_string  # noqa: E
 logger = logging.getLogger(__name__)
 
 RATES_SHARED = {"follower_hz": None, "exchange_hz": None, "webots_step_hz": None}
-FOLLOWER_HZ_HISTORY = []
+FOLLOWER_HZ_HISTORY: list[float] = []
 FOLLOWER_HZ_WINDOW = 20
 
 START_TIME = 0.0
@@ -52,11 +50,7 @@ LEADER_INIT_STEPS = [
 
 
 class FollowerPIDPursuit:
-    """Follow predecessor in common NED with roll/pitch PID (this scenario only).
-
-    Bundles DroneController, fixed PID instances, and one-shot vs loop control so
-    position/PID state is not threaded through long function signatures.
-    """
+    """Follow predecessor in common NED with roll/pitch PID (snake_pursuit only)."""
 
     def __init__(
         self,
@@ -105,13 +99,7 @@ class FollowerPIDPursuit:
         target_common: Dict[str, float],
         dt: Optional[float],
     ) -> Tuple[float, float]:
-        """Apply roll/pitch PID toward ``target_common``; send RC_OVERRIDE.
-
-        Same errors as before: error_x = rel x; error_y = rel y - 2 (formation spacing).
-
-        Returns:
-            ``(pitch_output, roll_output)`` before RC mapping.
-        """
+        """Apply roll/pitch PID toward ``target_common``; send RC_OVERRIDE."""
         w = self._drone.worker
         if w is None:
             return 0.0, 0.0
@@ -170,59 +158,32 @@ class FollowerPIDPursuit:
             pass
 
 
-def leader_pattern(
+def leader_roll_positive_y_loop(
     controller: DroneController,
-    forward_duration: float = 10,
     experiment_duration: float = 0,
+    roll_pwm: int = 1600,
+    step_sec: float = 0.1,
 ) -> None:
-    """Leader: forward → stop → backward → stop. pitch 1400=forward, 1600=backward.
+    """Leader: continuous roll bias, pitch neutral — POS_HOLD trajectory toward +Y (tune PWM in SITL).
 
     Args:
-        controller: Leader drone controller (MAVLink worker).
-        forward_duration: Seconds to fly forward and again backward before stopping.
+        controller: Leader drone controller.
         experiment_duration: If > 0, stop when global experiment time exceeds this (s).
+        roll_pwm: RC channel 1 (roll); default 1600 vs neutral 1500 — adjust sign/magnitude for your stack.
+        step_sec: Sleep between override commands.
     """
     global START_TIME
     if not controller.worker:
         return
-    start = time.time()
-    while time.time() - start < forward_duration:
-        if (
-            experiment_duration > 0
-            and (time.time() - START_TIME) >= experiment_duration
-        ):
+    while True:
+        if experiment_duration > 0 and (time.time() - START_TIME) >= experiment_duration:
             break
-        controller.worker.send_rc_override(RC_NEUTRAL, 1400, 1500, 1500, controller)
-        time.sleep(0.1)
-    controller.worker.send_set_mode(17)  # BRAKE
-    time.sleep(2)
-    controller.worker.send_set_mode(16)  # POS_HOLD
-    time.sleep(0.3)
-    controller.worker.send_rc_override(
-        RC_NEUTRAL, RC_NEUTRAL, RC_NEUTRAL, RC_NEUTRAL, controller=controller
-    )
-    time.sleep(0.5)
-    if experiment_duration > 0 and (time.time() - START_TIME) >= experiment_duration:
-        return
-    start = time.time()
-    while time.time() - start < forward_duration:
-        if (
-            experiment_duration > 0
-            and (time.time() - START_TIME) >= experiment_duration
-        ):
-            break
-        controller.worker.send_rc_override(RC_NEUTRAL, 1600, 1500, 1500, controller)
-        time.sleep(0.1)
-    controller.worker.send_set_mode(17)
-    time.sleep(2)
-    controller.worker.send_set_mode(16)
-    time.sleep(0.3)
-    controller.worker.send_rc_override(
-        RC_NEUTRAL, RC_NEUTRAL, RC_NEUTRAL, RC_NEUTRAL, controller=controller
-    )
+        controller.worker.send_rc_override(
+            roll_pwm, RC_NEUTRAL, RC_NEUTRAL, RC_NEUTRAL, controller=controller
+        )
+        time.sleep(step_sec)
 
 
-# Nominal formation spacing (m): desired distance between consecutive drones along Y
 FORMATION_D_STAR_M = 2.0
 
 
@@ -241,11 +202,11 @@ def initialize_drone_parallel(
 
 
 def main() -> None:
-    """Parse args, create controllers, run leader + followers and coord exchange."""
+    """Parse args, create controllers, run roll leader + followers and coord exchange."""
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Leader forward-back + follower (leader_forward_back)"
+        description="Snake pursuit: roll leader +Y + chain followers (snake_pursuit)"
     )
     parser.add_argument("--kp", type=float, default=8.0, help="P gain for follower PID")
     parser.add_argument(
@@ -260,7 +221,7 @@ def main() -> None:
         default=None,
         help=(
             "I gain for pitch (longitudinal X) only; roll keeps --ki. "
-            "Omit to use --ki for both axes (legacy). Try 0.02–0.15 to trim steady-state X gap."
+            "Omit to use --ki for both axes."
         ),
     )
     parser.add_argument("--kd", type=float, default=10.0, help="D gain")
@@ -281,10 +242,18 @@ def main() -> None:
         help="Control loop rate in Hz; 0 = no limit",
     )
     parser.add_argument(
-        "--leader-duration",
+        "--leader-roll-pwm",
+        type=int,
+        default=1600,
+        help=(
+            "Leader roll RC (PWM); not neutral to pull +Y in NED under POS_HOLD — tune per SITL"
+        ),
+    )
+    parser.add_argument(
+        "--leader-roll-step-sec",
         type=float,
-        default=10.0,
-        help="Leader forward/back duration (s)",
+        default=0.1,
+        help="Sleep between leader RC_OVERRIDE updates (s)",
     )
     parser.add_argument("--run-id", type=str, default=None, help="Suffix for log file")
     parser.add_argument(
@@ -392,7 +361,7 @@ def main() -> None:
     for cfg in drones_config:
         did = cfg["id"]
         path = os.path.join(experiment_dir, f"drone_{did}.csv")
-        f = open(path, "w")
+        f = open(path, "w", encoding="utf-8")
         f.write(CSV_HEADER + "\n")
         f.flush()
         experiment_log_files[did] = f
@@ -401,7 +370,7 @@ def main() -> None:
         args.duration,
         args.collision_radius,
         args.drones,
-        "leader_forward_back",
+        "snake_pursuit",
     )
 
     controllers = []
@@ -450,11 +419,14 @@ def main() -> None:
         followers = [c for c in controllers if c.config["role"] == "follower"]
         if not leader:
             return
-        leader_duration = getattr(args, "leader_duration", 10.0)
         threading.Thread(
-            target=leader_pattern,
-            args=(leader, leader_duration),
-            kwargs={"experiment_duration": args.duration},
+            target=leader_roll_positive_y_loop,
+            args=(leader,),
+            kwargs={
+                "experiment_duration": args.duration,
+                "roll_pwm": args.leader_roll_pwm,
+                "step_sec": args.leader_roll_step_sec,
+            },
             daemon=True,
         ).start()
 

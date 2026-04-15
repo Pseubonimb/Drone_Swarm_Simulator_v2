@@ -1,0 +1,35 @@
+# Конфигурация серии экспериментов (YAML). Парсер: core.batch (user_batch_params + param_cli).
+# Запуск: python launch_simulation.py -s --batch-params
+#         или python launch_simulation.py -s --batch-params scenarios/batch_parameters/user_batch_params.yaml
+
+# Необязательный блок batch: те же поля, что у launch:; launch перекрывает batch.
+batch:
+  scenario: leader_forward_back
+  drones: 2
+  duration_sec: 120.0
+
+launch:
+  # batch_id: my_thesis_run   # префикс папок experiments/batch_<id>_run_<n>
+  # scenario/drones/duration_sec можно задать только здесь вместо batch:
+  duration_sec: 120.0
+
+# Один перебираемый параметр (логическое имя → CLI сценария, см. core/batch/param_cli.py).
+# pid.p_gain → --kp ; pid.i_gain → --ki ; pid.d_gain → --kd ; pid.ki_pitch → --ki-pitch
+# pid.derivative_alpha → --derivative-alpha (фильтр D-цепи, 0..1)
+# sitl.ANGLE_MAX → оверлей .parm для SITL (сантидоли градуса)
+experiment_settings:
+  iterations: 1
+  target_parameter: "pid.p_gain"
+  range:
+    start: 1.0
+    stop: 16.0
+    step: 5.0
+
+# Несколько осей — декартово произведение (осторожно с числом комбинаций):
+# parameter_sweeps:
+#   - target_parameter: "pid.p_gain"
+#     range: { start: 4.0, stop: 8.0, step: 2.0 }
+#   - target_parameter: "pid.derivative_alpha"
+#     range: { start: 0.0, stop: 0.2, step: 0.1 }
+#   - target_parameter: "sitl.ANGLE_MAX"
+#     range: { start: 3000, stop: 4500, step: 1500 }

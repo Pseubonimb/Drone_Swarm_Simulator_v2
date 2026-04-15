@@ -24,12 +24,8 @@ from typing import Any, Dict, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 from core.control import DroneController, PIDRegulator
-from core.mavlink.utils import RC_NEUTRAL
-
-try:
-    from visualizer.position_publisher import publish_positions as _publish_positions
-except ImportError:
-    _publish_positions = None
+from core.mavlink.utils import RC_NEUTRAL, sitl_tcp_connection_string
+from core.network import CoordExchangeStepContext
 
 # Square step commands (roll, pitch, throttle, yaw)
 SQUARE_STEPS = [
@@ -280,17 +276,28 @@ def main() -> None:
         default=50.0,
         help="Coordinate exchange / sync loop rate (Hz); match SITL (default 50)",
     )
+    parser.add_argument(
+        "--sitl-direct-tcp",
+        action="store_true",
+        help=(
+            "MAVLink over ArduPilot SITL TCP (5760+10*i); use with launcher "
+            "sim_vehicle --no-mavproxy (no MAVProxy UDP)"
+        ),
+    )
     args = parser.parse_args()
 
     exchange_hz = max(0.0, float(args.exchange_hz))
-    loop_period_sec = (1.0 / exchange_hz) if exchange_hz > 0 else 0.02  # default 50 Hz
     log_hz = max(0.0, float(args.log_hz))
 
     num_drones = max(1, args.drones)
-    DRONES_CONFIG = [
-        {"id": i + 1, "udp_port": 14551 + i * 10, "role": "square"}
-        for i in range(num_drones)
-    ]
+    DRONES_CONFIG = []
+    for i in range(num_drones):
+        cfg: Dict[str, Any] = {"id": i + 1, "role": "square"}
+        if args.sitl_direct_tcp or os.environ.get("DRONE_SWARM_SITL_DIRECT_TCP") == "1":
+            cfg["mavlink_connection"] = sitl_tcp_connection_string(i)
+        else:
+            cfg["udp_port"] = 14551 + i * 10
+        DRONES_CONFIG.append(cfg)
     controllers = []
     for config in DRONES_CONFIG:
         controllers.append(SquareDroneController(config, logging_enabled=True))
@@ -302,63 +309,75 @@ def main() -> None:
             daemon=False,
         ).start()
     try:
-        init_barrier.wait(timeout=30)
+        init_barrier.wait(timeout=120)
     except threading.BrokenBarrierError:
         return
     time.sleep(2)
+    coord_mgr = None
     try:
-        square_threads = []
         for controller in controllers:
-            t = threading.Thread(
+            threading.Thread(
                 target=square_pattern,
                 args=(controller, STEP_DURATION, 100, 100, True),
                 kwargs={"velocity_threshold": 0.2},
                 daemon=True,
-            )
-            t.start()
-            square_threads.append(t)
+            ).start()
         last_log_time = 0.0
-        rates_shared: Dict[str, Optional[float]] = {"exchange_hz": exchange_hz if exchange_hz > 0 else None}
-        while True:
-            t0 = time.time()
-            # Publish positions for 2D visualizer (same NED convention as leader_forward_back)
-            positions: Dict[int, Dict[str, float]] = {}
-            for c in controllers:
-                try:
-                    pos = c.get_my_position()
-                    if pos:
-                        did = c.config["id"]
-                        positions[did] = {
-                            **pos,
-                            "y": pos.get("y", 0) + (did - 1) * 2.0,
-                        }
-                except Exception:
-                    pass
-            if _publish_positions is not None and positions:
-                try:
-                    _publish_positions(positions, rates=rates_shared)
-                except Exception:
-                    pass
-            do_log = log_hz <= 0 or (log_hz > 0 and (t0 - last_log_time) >= (1.0 / log_hz))
-            if do_log:
-                for c in controllers:
-                    if c.logging_enabled and hasattr(c, "logfile") and c.worker:
-                        try:
-                            vel = c.get_velocity()
-                            now = datetime.now()
-                            ts = f"{now.second:02d}.{now.microsecond // 1000:03d}"
-                            c.logfile.write(f"'t': {ts}, {vel}\n")
-                        except Exception:
-                            pass
-                if log_hz > 0:
-                    last_log_time = t0
-            elapsed = time.time() - t0
-            sleep_sec = loop_period_sec - elapsed
-            if sleep_sec > 0:
-                time.sleep(sleep_sec)
+        rates_shared: Dict[str, Optional[float]] = {
+            "exchange_hz": exchange_hz if exchange_hz > 0 else None
+        }
+
+        def square_on_step(ctx: CoordExchangeStepContext) -> None:
+            nonlocal last_log_time
+            t0 = ctx.wall_time
+            do_log = log_hz <= 0 or (
+                log_hz > 0 and (t0 - last_log_time) >= (1.0 / log_hz)
+            )
+            if not do_log:
+                return
+            for c in ctx.controllers:
+                if c.logging_enabled and hasattr(c, "logfile") and c.worker:
+                    try:
+                        vel = c.get_velocity()
+                        now = datetime.now()
+                        ts = f"{now.second:02d}.{now.microsecond // 1000:03d}"
+                        c.logfile.write(f"'t': {ts}, {vel}\n")
+                    except Exception:
+                        pass
+            if log_hz > 0:
+                last_log_time = t0
+
+        dur = max(0.0, float(args.duration))
+        coord_mgr = DroneController.start_swarm_coord_exchange(
+            controllers,
+            experiment_start_time=time.time(),
+            exchange_loop_hz=exchange_hz,
+            log_hz=log_hz,
+            duration=dur,
+            rates_shared=rates_shared,
+            update_neighbors=False,
+            publish_measured_exchange_hz=False,
+            local_to_common=lambda did, pos: {
+                **pos,
+                "y": pos.get("y", 0) + (did - 1) * 2.0,
+            },
+            on_step=square_on_step,
+            daemon=True,
+        )
+        if dur > 0:
+            time.sleep(dur)
+        else:
+            threading.Event().wait()
     except KeyboardInterrupt:
+        pass
+    finally:
+        if coord_mgr is not None:
+            coord_mgr.stop(join_timeout_sec=2.0)
         for controller in controllers:
-            controller.stop()
+            try:
+                controller.stop()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

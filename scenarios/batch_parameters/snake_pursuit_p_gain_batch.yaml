@@ -1,0 +1,39 @@
+# Внимание: при наличии parameter_sweeps блок experiment_settings с одной осью не используется.
+# Ниже — полное декартово произведение 5 осей по 5 точек = 5^5 = 3125 прогонов (не для routine OFAT).
+# Пошаговая настройка: scenarios/batch_parameters/ofat_snake_pursuit/README.md
+#
+# Запуск этого файла:
+#   python launch_simulation.py -s --batch-params scenarios/batch_parameters/snake_pursuit_p_gain_batch.yaml
+
+batch:
+  scenario: snake_pursuit
+  drones: 2
+  duration_sec: 30.0
+
+launch:
+  batch_id: snake_p_sweep   # префикс experiments/batch_<id>_run_<n>
+
+experiment_settings:
+  # iterations: 1 # количество повторов каждой комбинации параметров
+  target_parameter: "pid.p_gain"
+  range:
+    start: 0.0
+    stop: 20.0
+    step: 5.0
+
+# Несколько осей — декартово произведение (осторожно с числом комбинаций):
+parameter_sweeps:
+  - target_parameter: "pid.p_gain"
+    range: { start: 0.0, stop: 20.0, step: 5.0 }
+
+  - target_parameter: "pid.i_gain"
+    range: { start: 0.0, stop: 20.0, step: 5.0 }
+
+  - target_parameter: "pid.d_gain"
+    range: { start: 0.0, stop: 20.0, step: 5.0 }
+
+  - target_parameter: "pid.derivative_alpha"
+    range: { start: 0.0, stop: 1.0, step: 0.25 }
+
+  - target_parameter: "sitl.ANGLE_MAX"
+    range: { start: 3000, stop: 9000, step: 1500 }

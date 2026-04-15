@@ -1,0 +1,17 @@
+# OFAT этап 1: перебор только P (остальные — дефолты сценария).
+# Запуск: python launch_simulation.py -s --batch-params scenarios/batch_parameters/ofat_snake_pursuit/stage1_kp.yaml
+
+batch:
+  scenario: snake_pursuit
+  drones: 2
+  duration_sec: 30.0
+
+launch:
+  batch_id: snake_ofat_s1_kp
+
+experiment_settings:
+  target_parameter: "pid.p_gain"
+  range:
+    start: 2.0
+    stop: 14.0
+    step: 3.0

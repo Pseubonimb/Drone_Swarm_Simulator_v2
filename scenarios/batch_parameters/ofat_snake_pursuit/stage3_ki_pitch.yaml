@@ -1,0 +1,19 @@
+# OFAT этап 3: I только на pitch (уменьшение статической ошибки по X), roll I = 0.
+# Пример:
+#   python launch_simulation.py -s --kp 8 --kd 10 --ki 0 --batch-params \
+#     scenarios/batch_parameters/ofat_snake_pursuit/stage3_ki_pitch.yaml
+
+batch:
+  scenario: snake_pursuit
+  drones: 2
+  duration_sec: 30.0
+
+launch:
+  batch_id: snake_ofat_s3_ki_pitch
+
+experiment_settings:
+  target_parameter: "pid.ki_pitch"
+  range:
+    start: 0.0
+    stop: 0.12
+    step: 0.04
