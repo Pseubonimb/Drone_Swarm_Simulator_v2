@@ -4,6 +4,37 @@ Load experiment logs (CSV + metadata) and play them back in ROS/RViz for 3D visu
 
 **Prerequisites (both options):** Docker, X11. Once per session run `export DISPLAY=:0` and `xhost +local:docker` so containers can use the host display.
 
+**Python on the host:** when running `replay/replay_rviz.py` or `replay/replay_gui.py` locally, use the repo root with venv active: `source drone_env/bin/activate` (`drone_env/` lives **inside** the project directory, created by `setup_env.py`; see root **README.md**).
+
+## One run from a batch series (parameter sweep / `run_batch.py`)
+
+Batch runs are stored **under a session folder** with a start timestamp, not directly under `experiments/`.
+
+- **YAML batch** (`launch_simulation.py -s --batch-params …`):  
+  `experiments/<yyyy-mm-dd_hh-mm-ss>/batch_<label>_run_<n>/`  
+  Example: `experiments/2026-04-07_14-30-00/batch_user_batch_params_run_3/`
+- **`run_batch.py` with `--batch-id`**:  
+  `experiments/<yyyy-mm-dd_hh-mm-ss>/batch_<id>_run_<n>/`  
+  Example: `experiments/2026-04-07_15-00-00/batch_my_batch_run_2/`
+
+`<yyyy-mm-dd_hh-mm-ss>` is generated when that batch **starts** (new folder each run of the launcher/script). To replay **one** experiment, pass the **full path to that run directory** (the folder that contains `metadata.json` and `drone_*.csv`), not the parent session folder.
+
+Examples (from project root, paths relative to repo):
+
+```bash
+# Docker replay (Option 1 / 2)
+./scripts/replay-docker.sh experiments/2026-04-07_14-30-00/batch_user_batch_params_run_1 1.0
+
+./scripts/replay-with-rviz.sh experiments/2026-04-07_14-30-00/batch_user_batch_params_run_1 1.0
+```
+
+```bash
+# Host with ROS (see "Running without Docker" below)
+python replay/replay_rviz.py --experiment experiments/2026-04-07_14-30-00/batch_user_batch_params_run_1 --rate 1.0
+```
+
+List session folders under `experiments/` to pick a timestamp, then open the desired `batch_*_run_*` inside it. Optional: `batch_*_runs_index.json` inside the same session folder (from `run_batch.py`) lists `experiment_dir` paths for that batch.
+
 ## Launch options
 
 ### Option 1: Two terminals (current flow)
@@ -219,3 +250,4 @@ Or as module: `python -m replay.replay_rviz --experiment experiments/... --rate 
 - Script usage and workspace path: `scripts/replay-docker.sh` (default project root = directory above `scripts/`)
 - **Исправления 2D-визуализатора и MAVLink (01.03.26):** в `docs/found errors/01_03_26_errors_in_project.md` описаны внесённые изменения: один поток на одно MAVLink-подключение (MAVLinkWorker), отказ от хранения истории в реальном времени в 2D-визуализаторе (только текущие позиции).
 - **Исправления replay и core (03.03.26):** в `docs/found errors/03_03_26_errors_in_project.md` — один скрипт для Docker replay+RViz, синхронное пошаговое воспроизведение в RViz, начальные позиции дронов по Y (+2 м на дрон), вынос DroneController в `core/control`.
+- **Структура каталогов батча (06.04.26):** в `docs/found errors/06_04_26_errors_in_project.md` (п. 2) — папка сессии `experiments/<yyyy-mm-dd_hh-mm-ss>/` и вложенные `batch_*_run_*`; для replay см. раздел **One run from a batch series** выше.

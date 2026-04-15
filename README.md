@@ -8,6 +8,8 @@
 Drone_Swarm_Simulator_v2/
 ├── launch_simulation.py   # Единая точка входа (одиночный запуск)
 ├── run_batch.py           # Пакетный запуск серии экспериментов
+├── setup_env.py           # Создание venv и установка зависимостей
+├── drone_env/             # Виртуальное окружение Python (создаётся setup_env.py, не коммитить)
 ├── config/                # Параметры ArduPilot (iris.parm и др.)
 ├── core/                  # Ядро: MAVLink, мониторы, PID, логирование
 ├── scenarios/             # Сценарии (leader_forward_back, square_pid, ...)
@@ -45,7 +47,7 @@ Drone_Swarm_Simulator_v2/
        `libtiff-dev`, `libnotify-dev`, `freeglut3-dev`,
        `libgstreamer1.0-dev`, `libgstreamer-plugins-base1.0-dev`,
        `libwebkit2gtk-4.1-dev`
-   - создаёт виртуальное окружение `../drone_env` (относительно корня проекта)
+   - создаёт виртуальное окружение `drone_env/` **в корне репозитория** `Drone_Swarm_Simulator_v2` (рядом с `launch_simulation.py`, в `.gitignore`)
    - активирует его и устанавливает Python-зависимости через `pip`:
      - `pymavlink`, `pexpect`, `empy==3.3.4`, `dronecan`, `setuptools`, `PyYAML`
      - `numpy`, `matplotlib`, `pyserial`, `future`, `lxml`
@@ -57,15 +59,15 @@ Drone_Swarm_Simulator_v2/
 3. **Особенности и рекомендации**:
 
    - На свежих версиях Ubuntu (например, **Ubuntu 25.10**) пакет `wxPython` может отсутствовать в бинарном виде, поэтому `pip` может собирать его **из исходников** — это нормально, просто требует времени и установленного набора dev-библиотек (см. список выше).
-   - Виртуальное окружение `../drone_env` должно быть создано **на той системе, где вы запускаете симуляции**. Не переносите его целиком с Windows на Linux — создайте новое окружение на Linux с помощью `setup_env.py`.
+   - Каталог `drone_env/` должен быть создан **на той системе, где вы запускаете симуляции**. Не переносите его целиком с Windows на Linux — создайте новое окружение на Linux с помощью `setup_env.py`.
    - На Windows часть шагов (apt, обновление `~/.bashrc`) будет пропущена или ограничена, поэтому рекомендованный и поддерживаемый сценарий — запуск `setup_env.py` на Ubuntu и дальнейшая работа в этом окружении.
 
 
 ## Быстрый старт
 
 ```bash
-# Окружение
-source ../drone_env/bin/activate
+# Окружение (из корня репозитория)
+source drone_env/bin/activate
 
 # Одиночный запуск (из корня проекта)
 python launch_simulation.py -s -c leader_forward_back -n 3 --duration 60
@@ -101,4 +103,4 @@ python replay/replay_rviz.py --experiment experiments/exp_1 --rate 1.0
 
 - Python 3.10+, pymavlink, ArduPilot SITL (клон в `../ardupilot` по желанию).
 - Для replay: ROS (например Noetic), `rospy`.
-- Виртуальное окружение: `drone_env/`.
+- Виртуальное окружение: `drone_env/` в корне репозитория (создаётся `setup_env.py`).

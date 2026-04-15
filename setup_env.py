@@ -9,7 +9,7 @@ VENV_DIR_NAME = "drone_env"
 def main() -> None:
     """Create and configure Python environment for Drone_Swarm_Simulator_v2."""
     project_root = os.path.dirname(os.path.abspath(__file__))
-    venv_path = os.path.join(project_root, "..", VENV_DIR_NAME)
+    venv_path = os.path.join(project_root, VENV_DIR_NAME)
 
     if os.name == "posix":
         python_version = f"{sys.version_info.major}.{sys.version_info.minor}"

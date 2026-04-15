@@ -10,7 +10,7 @@ Real-time 2D plot of drone positions over UDP, plus optional 2D replay from expe
 | **Live 2D** (with simulation) | `python launch_simulation.py -s -c leader_forward_back --with-2d-visualizer` |
 | **2D Replay** (from CSV) | `python visualizer/replay_2d.py --experiment experiments/<timestamp>` |
 
-All commands are run from the **project root**. The visualizer is optional; simulation runs normally if the visualizer is not started.
+All commands are run from the **project root**. Activate the project venv first: `source drone_env/bin/activate` — the `drone_env/` directory is created **inside the repository root** by `setup_env.py` (see the root **README.md**). The visualizer is optional; simulation runs normally if the visualizer is not started.
 
 ## Coordinate convention (NED)
 
