@@ -65,7 +65,6 @@ class FollowerPIDPursuit:
         kp: float = 500.0,
         ki: float = 0.0,
         kd: float = 0.0,
-        ki_pitch: Optional[float] = None,
         derivative_alpha: float = 0.0,
         control_loop_period_sec: Optional[float] = None,
         experiment_duration: float = 0,
@@ -74,7 +73,6 @@ class FollowerPIDPursuit:
         self._predecessor_id = predecessor_id
         self._control_loop_period_sec = control_loop_period_sec
         self._experiment_duration = experiment_duration
-        pitch_ki = ki if ki_pitch is None else ki_pitch
         self._roll_pid = PIDRegulator(
             kp=kp,
             ki=ki,
@@ -85,7 +83,7 @@ class FollowerPIDPursuit:
         )
         self._pitch_pid = PIDRegulator(
             kp=kp,
-            ki=pitch_ki,
+            ki=ki,
             kd=kd,
             integral_limit=100.0,
             output_limit=200.0,
@@ -252,16 +250,7 @@ def main() -> None:
         "--ki",
         type=float,
         default=0.0,
-        help="I gain for roll (lateral); pitch too if --ki-pitch omitted",
-    )
-    parser.add_argument(
-        "--ki-pitch",
-        type=float,
-        default=None,
-        help=(
-            "I gain for pitch (longitudinal X) only; roll keeps --ki. "
-            "Omit to use --ki for both axes (legacy). Try 0.02–0.15 to trim steady-state X gap."
-        ),
+        help="I gain for follower PID on both roll and pitch",
     )
     parser.add_argument("--kd", type=float, default=10.0, help="D gain")
     parser.add_argument(
@@ -465,7 +454,6 @@ def main() -> None:
                 kp=args.kp,
                 ki=args.ki,
                 kd=args.kd,
-                ki_pitch=args.ki_pitch,
                 derivative_alpha=float(args.derivative_alpha),
                 control_loop_period_sec=args.control_loop_period_sec,
                 experiment_duration=args.duration,

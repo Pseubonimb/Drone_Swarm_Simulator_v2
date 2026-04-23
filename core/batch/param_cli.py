@@ -11,14 +11,12 @@ SCENARIO_PID_CLI_FLAGS: Dict[str, Dict[str, str]] = {
         "pid.p_gain": "--kp",
         "pid.i_gain": "--ki",
         "pid.d_gain": "--kd",
-        "pid.ki_pitch": "--ki-pitch",
         "pid.derivative_alpha": "--derivative-alpha",
     },
     "snake_pursuit": {
         "pid.p_gain": "--kp",
         "pid.i_gain": "--ki",
         "pid.d_gain": "--kd",
-        "pid.ki_pitch": "--ki-pitch",
         "pid.derivative_alpha": "--derivative-alpha",
     },
 }

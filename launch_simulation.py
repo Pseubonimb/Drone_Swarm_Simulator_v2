@@ -152,6 +152,12 @@ SCENARIOS: List[Tuple[str, str, str, str]] = [
         "scenarios/square_formation.py",
         project_root,
     ),
+    (
+        "snake_distance_ground_follower",
+        "Snake leader +Y, follower on ground, distance CSV",
+        "scenarios/snake_distance_ground_follower.py",
+        project_root,
+    ),
 ]
 
 # Russian labels for the interactive scenario menu (see образец_интерактивного_меню.txt).
@@ -159,6 +165,7 @@ INTERACTIVE_SCENARIO_LABELS_RU: Tuple[str, ...] = (
     "Лидер: вперёд–назад",
     "Преследование змейкой (+Y)",
     "Движение формации",
+    "Лидер +Y, фолловер на земле, лог расстояния",
 )
 
 
@@ -434,7 +441,7 @@ def _run_batch_from_yaml(args: argparse.Namespace) -> int:
 
     Args:
         args: Parsed CLI including ``batch_params`` (path to YAML), ``param_file``,
-            ``exchange_hz``, ``ki_pitch``, and optional 2D visualizer flags.
+            ``exchange_hz``, and optional 2D visualizer flags.
 
     Returns:
         0 if every subprocess exited successfully, else 1.
@@ -586,8 +593,6 @@ def _run_batch_from_yaml(args: argparse.Namespace) -> int:
                 cmd.extend(["--ki", str(args.ki)])
             if args.kd is not None and "pid.d_gain" not in scenario_combo:
                 cmd.extend(["--kd", str(args.kd)])
-            if args.ki_pitch is not None and "pid.ki_pitch" not in scenario_combo:
-                cmd.extend(["--ki-pitch", str(args.ki_pitch)])
             if args.derivative_alpha is not None and "pid.derivative_alpha" not in scenario_combo:
                 cmd.extend(["--derivative-alpha", str(args.derivative_alpha)])
         if args.with_2d_visualizer:
@@ -668,7 +673,8 @@ def run_interactive_menu() -> Tuple[bool, Tuple[str, str, str, str], int, bool]:
         scenario = SCENARIOS[0]
         while True:
             custom = input(
-                "    Введите id сценария (leader_forward_back, snake_pursuit, square_pid) "
+                "    Введите id сценария (leader_forward_back, snake_pursuit, square_pid, "
+                "snake_distance_ground_follower) "
                 "или относительный путь к .py: "
             ).strip()
             found = _scenario_from_custom_input(custom)
@@ -819,7 +825,7 @@ Examples:
         type=float,
         default=None,
         metavar="K",
-        help="leader_forward_back / snake_pursuit: follower I gain (roll; pitch if --ki-pitch omitted).",
+        help="leader_forward_back / snake_pursuit: follower I gain (roll and pitch).",
     )
     parser.add_argument(
         "--kd",
@@ -827,16 +833,6 @@ Examples:
         default=None,
         metavar="K",
         help="leader_forward_back / snake_pursuit: follower D gain; forwarded to scenario (--kd).",
-    )
-    parser.add_argument(
-        "--ki-pitch",
-        type=float,
-        default=None,
-        metavar="K",
-        help=(
-            "leader_forward_back / snake_pursuit: follower pitch-axis I gain (--ki-pitch). "
-            "Try 0.03–0.1 to reduce steady-state X gap; roll keeps --ki (default 0)."
-        ),
     )
     parser.add_argument(
         "--derivative-alpha",
@@ -854,8 +850,8 @@ Examples:
         default=None,
         metavar="PWM",
         help=(
-            "snake_pursuit only: leader roll RC override; passed as --leader-roll-pwm "
-            "(omit to use scenario default 1600)."
+            "snake_pursuit / snake_distance_ground_follower: leader roll RC override; "
+            "passed as --leader-roll-pwm (omit to use scenario default 1600)."
         ),
     )
     parser.add_argument(
@@ -916,6 +912,13 @@ Examples:
         use_2d_visualizer = args.with_2d_visualizer
 
     _, scenario_desc, script_rel, scenario_cwd = scenario
+    if scenario[0] == "snake_distance_ground_follower" and num_drones != 2:
+        logger.info(
+            "[Launcher] Scenario snake_distance_ground_follower requires exactly 2 drones; "
+            "overriding num_drones from %s to 2.",
+            num_drones,
+        )
+        num_drones = 2
     script_path = (
         os.path.join(project_root, script_rel)
         if not os.path.isabs(script_rel)
@@ -1052,13 +1055,6 @@ Examples:
         logger.warning(
             "[Launcher] --kp/--ki/--kd apply only to leader_forward_back and snake_pursuit; ignoring."
         )
-    if args.ki_pitch is not None:
-        if scenario[0] in ("leader_forward_back", "snake_pursuit"):
-            scenario_cmd.extend(["--ki-pitch", str(args.ki_pitch)])
-        else:
-            logger.warning(
-                "[Launcher] --ki-pitch applies only to leader_forward_back and snake_pursuit; ignoring."
-            )
     if args.derivative_alpha is not None:
         if scenario[0] in ("leader_forward_back", "snake_pursuit"):
             scenario_cmd.extend(["--derivative-alpha", str(args.derivative_alpha)])
@@ -1067,11 +1063,12 @@ Examples:
                 "[Launcher] --derivative-alpha applies only to leader_forward_back and snake_pursuit; ignoring."
             )
     if args.leader_roll_pwm is not None:
-        if scenario[0] == "snake_pursuit":
+        if scenario[0] in ("snake_pursuit", "snake_distance_ground_follower"):
             scenario_cmd.extend(["--leader-roll-pwm", str(args.leader_roll_pwm)])
         else:
             logger.warning(
-                "[Launcher] --leader-roll-pwm applies only to snake_pursuit; ignoring."
+                "[Launcher] --leader-roll-pwm applies only to snake_pursuit and "
+                "snake_distance_ground_follower; ignoring."
             )
     scenario_proc = subprocess.Popen(
         scenario_cmd,
