@@ -1,0 +1,20 @@
+# OFAT этап 3: перебор только I (`pid.i_gain` → `--ki`) на обоих осях roll/pitch.
+# Зафиксируйте лучшие kp*, kd* с этапов 1–2 флагами лаунчера (ki задаётся только из YAML).
+# Пример:
+#   python launch_simulation.py -s --kp <kp_star> --kd <kd_star> --batch-params \
+#     scenarios/batch_parameters/ofat_snake_pursuit/stage3_ki.yaml
+
+batch:
+  scenario: snake_pursuit
+  drones: 2
+  duration_sec: 30.0
+
+launch:
+  batch_id: snake_ofat_s3_ki
+
+experiment_settings:
+  target_parameter: "pid.i_gain"
+  range:
+    start: 1.0
+    stop: 21.0
+    step: 5.0

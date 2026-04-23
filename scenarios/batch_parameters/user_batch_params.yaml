@@ -14,7 +14,7 @@ launch:
   duration_sec: 120.0
 
 # Один перебираемый параметр (логическое имя → CLI сценария, см. core/batch/param_cli.py).
-# pid.p_gain → --kp ; pid.i_gain → --ki ; pid.d_gain → --kd ; pid.ki_pitch → --ki-pitch
+# pid.p_gain → --kp ; pid.i_gain → --ki ; pid.d_gain → --kd
 # pid.derivative_alpha → --derivative-alpha (фильтр D-цепи, 0..1)
 # sitl.ANGLE_MAX → оверлей .parm для SITL (сантидоли градуса)
 experiment_settings:

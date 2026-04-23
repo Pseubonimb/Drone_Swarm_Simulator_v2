@@ -13,6 +13,6 @@ launch:
 experiment_settings:
   target_parameter: "pid.d_gain"
   range:
-    start: 0.0
-    stop: 20.0
-    step: 5.0
+    start: 20.0
+    stop: 50.0
+    step: 10.0

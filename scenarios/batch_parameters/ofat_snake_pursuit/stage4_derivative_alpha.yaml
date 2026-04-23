@@ -1,6 +1,6 @@
-# OFAT этап 4: сглаживание D-цепи после выбора P, D, ki_pitch.
+# OFAT этап 4: сглаживание D-цепи после выбора P, D, ki.
 # Пример:
-#   python launch_simulation.py -s --kp 8 --kd 10 --ki 0 --ki-pitch 0.04 --batch-params \
+#   python launch_simulation.py -s --kp <kp*> --kd <kd*> --ki <ki*> --batch-params \
 #     scenarios/batch_parameters/ofat_snake_pursuit/stage4_derivative_alpha.yaml
 
 batch:
@@ -15,5 +15,5 @@ experiment_settings:
   target_parameter: "pid.derivative_alpha"
   range:
     start: 0.0
-    stop: 0.3
-    step: 0.1
+    stop: 1.0
+    step: 0.25
