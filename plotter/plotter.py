@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-Plot batch experiment families: reads ``batch_run.json`` + ``drone_*.csv`` under each run directory.
+Plot experiment CSV logs: **batch** runs (``batch_run.json`` + ``drone_*.csv`` per run dir) or a **single**
+run folder (``metadata.json`` + ``drone_*.csv`` at e.g. ``experiments/<YYYY-MM-DD_HH-MM-SS>/``).
 
 Run from project root (or pass ``--project-root``).
 
 Examples:
+  python plotter/plotter.py --experiment-dir experiments/2026-04-19_15-59-36 --out-dir plots
+  # → plots/<stamp>/single_run_time_overlay.png (лидер drone_1, follower drone_2)
+  python plotter/plotter.py --experiment-dir experiments/… --time-overlay-metric chain_mean_dxy
+  # → single_run_time_overlay_chain.png — среднее расстояние по звеньям 1→2→…→N (все drone_*.csv)
   python plotter/plotter.py --mode time_overlay --out-dir plots
   # → plots/<same session stamp>/batch_time_overlay.png when runs are under experiments/<stamp>/
   python plotter/plotter.py --runs-glob 'experiments/2026-04-08_22-01-21/batch_*_run_*'  # явная сессия
@@ -36,6 +41,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from core.experiment.csv_io import (  # noqa: E402
+    chain_mean_distance_xy_series,
     leader_follower_distance_xy_series,
     leader_follower_dx_series,
     load_drone_csv,
@@ -43,6 +49,7 @@ from core.experiment.csv_io import (  # noqa: E402
 )
 
 BATCH_RUN_JSON = "batch_run.json"
+METADATA_JSON = "metadata.json"
 
 # Batch session folders: experiments/YYYY-MM-DD_HH-MM-SS/ (4-digit year only).
 _EXPERIMENT_SESSION_DIR_RE = re.compile(
@@ -105,11 +112,18 @@ def infer_experiment_session_stamp_for_outputs(run_dirs: List[Path]) -> Optional
         p = rd.resolve()
         parent = p.parent
         grand = parent.parent
+        # Batch layout: experiments/<stamp>/batch_*_run_*
         if (
             grand.name == "experiments"
             and _EXPERIMENT_SESSION_DIR_RE.fullmatch(parent.name) is not None
         ):
             stamps.add(parent.name)
+        # Single run at experiments/<stamp>/ (metadata.json + drone_*.csv at session root)
+        elif (
+            parent.name == "experiments"
+            and _EXPERIMENT_SESSION_DIR_RE.fullmatch(p.name) is not None
+        ):
+            stamps.add(p.name)
     if len(stamps) == 1:
         return next(iter(stamps))
     if len(stamps) > 1:
@@ -185,6 +199,48 @@ def leader_follower_distance_xy_resampled(
     return t_fine, d.astype(float)
 
 
+def chain_mean_distance_xy_resampled(
+    drones: List[np.ndarray],
+    num_points: int = 800,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Mean planar XY distance along consecutive drones on a uniform time grid.
+
+    Time window: intersection of all drones' CSV time spans. Interpolates each ``(x,y)`` onto
+    ``linspace`` then averages link lengths (same definition as
+    :func:`core.experiment.csv_io.chain_mean_distance_xy_series`).
+    """
+    if len(drones) < 2 or any(len(d) == 0 for d in drones):
+        return np.array([]), np.array([])
+    t_starts: List[float] = []
+    t_ends: List[float] = []
+    for d in drones:
+        if len(d) == 0:
+            return np.array([]), np.array([])
+        t_starts.append(float(np.min(d[:, 0])))
+        t_ends.append(float(np.max(d[:, 0])))
+    t_start = max(t_starts)
+    t_end = min(t_ends)
+    if t_end <= t_start:
+        return chain_mean_distance_xy_series(drones)
+    n = int(np.clip(num_points, 2, 10000))
+    t_fine = np.linspace(t_start, t_end, n)
+    xs: List[np.ndarray] = []
+    ys: List[np.ndarray] = []
+    for d in drones:
+        tx, x = _time_x_for_interp(d[:, 0], d[:, 1])
+        ty, y = _time_x_for_interp(d[:, 0], d[:, 2])
+        xi = np.interp(t_fine, tx, x)
+        yi = np.interp(t_fine, ty, y)
+        xs.append(xi)
+        ys.append(yi)
+    link_dists: List[np.ndarray] = []
+    for i in range(len(drones) - 1):
+        link_dists.append(np.hypot(xs[i + 1] - xs[i], ys[i + 1] - ys[i]))
+    stacked = np.vstack(link_dists)
+    mean_d = np.mean(stacked, axis=0)
+    return t_fine, mean_d.astype(float)
+
+
 def _leader_follower_series(
     d1: np.ndarray,
     d2: np.ndarray,
@@ -221,6 +277,114 @@ def load_run_pair_csvs(
     d1 = load_drone_csv(d1p)
     d2 = load_drone_csv(d2p)
     return meta, d1, d2
+
+
+def load_single_run_pair_csvs(
+    experiment_dir: Path,
+) -> Tuple[Optional[Dict[str, Any]], Optional[np.ndarray], Optional[np.ndarray]]:
+    """Load standalone experiment: ``metadata.json`` + ``drone_1.csv`` / ``drone_2.csv`` (no batch_run).
+
+    Returns a dict shaped like batch metadata so :func:`plot_time_overlay` and RMS metrics work:
+    ``params`` is filled from ``scenario`` / ``num_drones`` for the legend.
+    """
+    meta_path = experiment_dir / METADATA_JSON
+    if not meta_path.is_file():
+        logger.warning("Skip %s: no %s", experiment_dir, METADATA_JSON)
+        return None, None, None
+    with meta_path.open(encoding="utf-8") as f:
+        meta_raw = json.load(f)
+    d1p = experiment_dir / "drone_1.csv"
+    d2p = experiment_dir / "drone_2.csv"
+    if not d1p.is_file() or not d2p.is_file():
+        logger.warning("Skip %s: missing drone_1/2 CSV", experiment_dir)
+        return None, None, None
+    d1 = load_drone_csv(d1p)
+    d2 = load_drone_csv(d2p)
+    params: Dict[str, Any] = {}
+    sc = meta_raw.get("scenario")
+    if sc is not None:
+        params["scenario"] = sc
+    nd = meta_raw.get("num_drones")
+    if nd is not None:
+        params["num_drones"] = int(nd)
+    meta: Dict[str, Any] = {
+        "run_index": 1,
+        "params": params,
+        "scenario_id": sc,
+        "metadata": meta_raw,
+    }
+    return meta, d1, d2
+
+
+def load_experiment_dir_pair_csvs(
+    experiment_dir: Path,
+) -> Tuple[Optional[Dict[str, Any]], Optional[np.ndarray], Optional[np.ndarray]]:
+    """Prefer ``batch_run.json`` if present (one batch run dir); else ``metadata.json`` standalone."""
+    if (experiment_dir / BATCH_RUN_JSON).is_file():
+        return load_run_pair_csvs(experiment_dir)
+    return load_single_run_pair_csvs(experiment_dir)
+
+
+def sequential_drone_csv_paths(run_dir: Path) -> List[Path]:
+    """``drone_1.csv``, ``drone_2.csv``, … until the first missing index."""
+    paths: List[Path] = []
+    i = 1
+    while True:
+        p = run_dir / f"drone_{i}.csv"
+        if not p.is_file():
+            break
+        paths.append(p)
+        i += 1
+    return paths
+
+
+def load_experiment_meta_dict(run_dir: Path) -> Optional[Dict[str, Any]]:
+    """Same metadata shape as batch/single pair loaders, without requiring drone CSV presence."""
+    if (run_dir / BATCH_RUN_JSON).is_file():
+        with (run_dir / BATCH_RUN_JSON).open(encoding="utf-8") as f:
+            return json.load(f)
+    meta_path = run_dir / METADATA_JSON
+    if not meta_path.is_file():
+        return None
+    with meta_path.open(encoding="utf-8") as f:
+        meta_raw = json.load(f)
+    params: Dict[str, Any] = {}
+    sc = meta_raw.get("scenario")
+    if sc is not None:
+        params["scenario"] = sc
+    nd = meta_raw.get("num_drones")
+    if nd is not None:
+        params["num_drones"] = int(nd)
+    return {
+        "run_index": 1,
+        "params": params,
+        "scenario_id": sc,
+        "metadata": meta_raw,
+    }
+
+
+def load_experiment_dir_drone_chain(
+    run_dir: Path,
+) -> Tuple[Optional[Dict[str, Any]], Optional[List[np.ndarray]]]:
+    """Load ``batch_run.json`` or ``metadata.json`` and all sequential ``drone_*.csv``.
+
+    Returns:
+        ``(meta, drones)`` with ``drones = [drone_1, …, drone_N]``, or Nones if unusable.
+    """
+    meta = load_experiment_meta_dict(run_dir)
+    paths = sequential_drone_csv_paths(run_dir)
+    if meta is None:
+        logger.warning("Skip %s: no batch_run.json or metadata.json", run_dir)
+        return None, None
+    if len(paths) < 2:
+        logger.warning(
+            "Skip %s: chain_mean needs ≥2 sequential drone_*.csv (found %d)",
+            run_dir,
+            len(paths),
+        )
+        return meta, None
+    drones = [load_drone_csv(p) for p in paths]
+    return meta, drones
 
 
 def load_run_dx(
@@ -352,13 +516,27 @@ def plot_heatmap(
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     parser = argparse.ArgumentParser(
-        description="Batch experiment plotter (CSV + batch_run.json)"
+        description=(
+            "Experiment plotter: batch runs (batch_run.json) or single run "
+            "(metadata.json under experiments/<stamp>/)."
+        )
     )
     parser.add_argument(
         "--project-root",
         type=Path,
         default=_PROJECT_ROOT,
         help="Repository root (default: parent of plotter/).",
+    )
+    parser.add_argument(
+        "--experiment-dir",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help=(
+            "Single experiment folder (metadata.json + drone_*.csv), or one batch run folder "
+            "with batch_run.json. Relative paths are resolved under --project-root. "
+            "When set, --runs-glob is ignored."
+        ),
     )
     parser.add_argument(
         "--runs-glob",
@@ -425,18 +603,32 @@ def main() -> None:
     )
     parser.add_argument(
         "--time-overlay-metric",
-        choices=("dx", "dxy"),
+        choices=("dx", "dxy", "chain_mean_dxy"),
         default="dxy",
         help=(
-            "time_overlay: dx = x_follower−x_leader (для разрыва по X); "
-            "dxy = плоская дистанция √(Δx²+Δy²) — лучше для змейки по Y, когда x почти не меняется."
+            "time_overlay: dx = Δx между drone_1 и drone_2; "
+            "dxy = √(Δx²+Δy²) между ними же; "
+            "chain_mean_dxy = среднее по звеньям (1→2,…,N−1→N) по всем drone_*.csv, N≥2."
         ),
     )
     args = parser.parse_args()
     root = args.project_root.resolve()
     out_base = args.out_dir if args.out_dir.is_absolute() else root / args.out_dir
 
-    if args.runs_glob is None:
+    single_experiment_dir: Optional[Path] = None
+    if args.experiment_dir is not None:
+        single_experiment_dir = (
+            args.experiment_dir
+            if args.experiment_dir.is_absolute()
+            else (root / args.experiment_dir)
+        ).resolve()
+        if not single_experiment_dir.is_dir():
+            logger.error("Not a directory: %s", single_experiment_dir)
+            sys.exit(1)
+        run_dirs = [single_experiment_dir]
+        glob_desc = str(single_experiment_dir.relative_to(root)) if single_experiment_dir.is_relative_to(root) else str(single_experiment_dir)
+        logger.info("Single experiment: %s", glob_desc)
+    elif args.runs_glob is None:
         run_dirs, glob_desc = discover_batch_run_dirs_latest_session(root)
         if not glob_desc:
             logger.error(
@@ -457,16 +649,33 @@ def main() -> None:
     if session_for_plots:
         logger.info("Output under session folder: %s", plot_out_base)
 
+    if args.mode == "heatmap" and single_experiment_dir is not None:
+        logger.error("heatmap needs multiple runs; omit --experiment-dir.")
+        sys.exit(1)
+
     rs = max(0, args.resample_points)
+    use_chain = args.time_overlay_metric == "chain_mean_dxy"
     loaded: List[Tuple[Path, Dict[str, Any], np.ndarray, np.ndarray]] = []
     metrics: List[Tuple[Path, Dict[str, Any], float]] = []
     for rd in run_dirs:
-        meta, d1, d2 = load_run_pair_csvs(rd)
-        if meta is None or d1 is None or d2 is None:
-            continue
-        t_ov, y_ov = _leader_follower_series(
-            d1, d2, metric=args.time_overlay_metric, resample_points=rs
-        )
+        if use_chain:
+            meta, drones = load_experiment_dir_drone_chain(rd)
+            if meta is None or drones is None or len(drones) < 2:
+                continue
+            if rs > 0:
+                t_ov, y_ov = chain_mean_distance_xy_resampled(
+                    drones, num_points=rs
+                )
+            else:
+                t_ov, y_ov = chain_mean_distance_xy_series(drones)
+            d1, d2 = drones[0], drones[1]
+        else:
+            meta, d1, d2 = load_experiment_dir_pair_csvs(rd)
+            if meta is None or d1 is None or d2 is None:
+                continue
+            t_ov, y_ov = _leader_follower_series(
+                d1, d2, metric=args.time_overlay_metric, resample_points=rs
+            )
         if len(t_ov) == 0:
             continue
         loaded.append((rd, meta, t_ov, y_ov))
@@ -480,20 +689,33 @@ def main() -> None:
         if not loaded:
             logger.error("No plottable runs.")
             sys.exit(1)
-        out = plot_out_base / "batch_time_overlay.png"
+        chain_suffix = "_chain" if args.time_overlay_metric == "chain_mean_dxy" else ""
+        if single_experiment_dir is not None:
+            out = plot_out_base / f"single_run_time_overlay{chain_suffix}.png"
+            batch_suffix = ""
+        else:
+            out = plot_out_base / f"batch_time_overlay{chain_suffix}.png"
+            batch_suffix = " (batch)"
         if args.time_overlay_metric == "dx":
             ylab = "x_follower − x_leader (m)"
-            ttl = "Follower − leader Δx (batch)"
+            ttl = f"Follower − leader Δx{batch_suffix}"
+        elif args.time_overlay_metric == "chain_mean_dxy":
+            ylab = "Mean planar link distance (chain 1→…→N) (m)"
+            ttl = f"Mean XY distance along drone chain{batch_suffix}"
         else:
             ylab = "Planar distance √(Δx² + Δy²) (m)"
-            ttl = "Follower − leader planar distance (batch)"
+            ttl = f"Follower − leader planar distance{batch_suffix}"
         plot_time_overlay(loaded, out, title=ttl, ylabel=ylab)
         logger.info("Wrote %s", out)
     elif args.mode == "bar_metric":
         if not metrics:
             logger.error("No metrics computed (need drone CSVs + data in tail).")
             sys.exit(1)
-        out = plot_out_base / "batch_bar_rms_dx.png"
+        out = (
+            plot_out_base / "single_run_bar_rms_dx.png"
+            if single_experiment_dir is not None
+            else plot_out_base / "batch_bar_rms_dx.png"
+        )
         plot_bar_metric(
             [(a, b, c) for a, b, c in metrics],
             out,
