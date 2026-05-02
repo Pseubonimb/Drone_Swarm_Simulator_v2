@@ -2,7 +2,8 @@
 """
 Plot experiment CSV logs: position (x, y, z) vs time and 2D trajectory.
 
-Reads experiment directory (metadata.json + drone_*.csv), optionally downsamples
+Reads experiment directory (trajectory ``drone_<id>.csv`` only — not
+``*_time_sync_steps.csv``), optionally downsamples
 to reduce duplicate rows (same position logged many times when loop runs faster
 than SITL position updates).
 
@@ -13,6 +14,7 @@ Usage:
 
 import argparse
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -34,7 +36,11 @@ def load_drone_csv(path: str) -> np.ndarray:
     with open(path, "r", encoding="utf-8") as f:
         header = f.readline()
         if "t,x,y,z" not in header:
-            raise ValueError(f"Unexpected CSV header: {header.strip()}")
+            raise ValueError(
+                f"Unexpected CSV header (need trajectory t,x,y,z,...): {header.strip()[:120]}..."
+                if len(header) > 120
+                else f"Unexpected CSV header (need trajectory t,x,y,z,...): {header.strip()}"
+            )
         for line in f:
             line = line.strip()
             if not line:
@@ -46,6 +52,20 @@ def load_drone_csv(path: str) -> np.ndarray:
                    float(parts[4]), float(parts[5]), float(parts[6]), int(parts[7])]
             data.append(row)
     return np.array(data) if data else np.zeros((0, 8))
+
+
+def position_trajectory_csv_paths(exp: Path) -> list[Path]:
+    """
+    Return ``drone_<n>.csv`` trajectory files only.
+
+    Excludes auxiliary logs such as ``drone_<n>_time_sync_steps.csv`` matched by
+    a naive ``drone_*.csv`` glob.
+    """
+    paths: list[Path] = []
+    for p in sorted(exp.glob("drone_*.csv")):
+        if re.fullmatch(r"drone_\d+\.csv", p.name):
+            paths.append(p)
+    return paths
 
 
 def downsample_unique_positions(arr: np.ndarray, min_dt: float = 0.0) -> np.ndarray:
@@ -109,9 +129,13 @@ def plot_experiment(experiment_dir: str, downsample_hz: float = 0, out_path: str
     if not exp.is_dir():
         raise FileNotFoundError(f"Not a directory: {experiment_dir}")
 
-    csv_files = sorted(exp.glob("drone_*.csv"))
+    csv_files = position_trajectory_csv_paths(exp)
     if not csv_files:
-        raise FileNotFoundError(f"No drone_*.csv in {experiment_dir}")
+        raise FileNotFoundError(
+            f"No trajectory drone_<id>.csv in {experiment_dir} "
+            f"(found no files matching name pattern drone_<number>.csv; "
+            f"step-sync logs like drone_*_time_sync_steps.csv are ignored)."
+        )
 
     position_errors_path = exp / "position_errors.csv"
     has_errors = position_errors_path.is_file()
