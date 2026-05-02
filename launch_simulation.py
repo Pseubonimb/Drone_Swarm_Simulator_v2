@@ -10,7 +10,8 @@ Usage:
   python launch_simulation.py -s -c leader_forward_back --with-2d-visualizer \\
       --viz-fixed-axes --viz-xlim -40 40 --viz-ylim -10 50   # fixed matplotlib window (NED m)
   python launch_simulation.py -s --batch-params   # sequential PID sweep from YAML (SITL-only)
-  python launch_simulation.py -s -c leader_forward_back --with-mavproxy-consoles  # MAVProxy GUIs + pkill cleanup
+  python launch_simulation.py -s -c leader_forward_back  # default: MAVProxy GUIs + pkill cleanup
+  python launch_simulation.py -s -c leader_forward_back --without-mavproxy-consoles  # direct TCP from scenarios
 
 Simulation modes:
   --webots, -w      Webots 3D + SITL
@@ -607,8 +608,8 @@ def _run_batch_from_yaml(args: argparse.Namespace) -> int:
                     cmd.extend(
                         ["--viz-ylim", str(args.viz_ylim[0]), str(args.viz_ylim[1])]
                     )
-        if args.with_mavproxy_consoles:
-            cmd.append("--with-mavproxy-consoles")
+        if args.without_mavproxy_consoles:
+            cmd.append("--without-mavproxy-consoles")
 
         proc = subprocess.run(
             cmd,
@@ -870,22 +871,16 @@ Examples:
         ),
     )
     parser.add_argument(
-        "--with-mavproxy-consoles",
+        "--without-mavproxy-consoles",
         action="store_true",
         help=(
-            "SITL-only: start MAVProxy with --console (UDP outs to scenarios). "
-            "After each launcher run (normal or interrupt), runs: pkill -f mavproxy.py "
-            "— terminates every MAVProxy on this machine matching that pattern. "
-            "Incompatible with --webots."
+            "SITL-only: disable default MAVProxy --console mode and run direct TCP "
+            "(scenarios connect to 127.0.0.1:5760+10*i). "
+            "By default MAVProxy consoles are enabled and the launcher runs "
+            "pkill -f mavproxy.py on shutdown."
         ),
     )
     args = parser.parse_args()
-
-    if args.with_mavproxy_consoles and args.webots:
-        logger.error(
-            "[Launcher] --with-mavproxy-consoles is only for SITL-only; do not use --webots."
-        )
-        sys.exit(1)
 
     if args.batch_params is not None:
         if args.webots:
@@ -928,7 +923,8 @@ Examples:
         logger.error("Scenario not found: %s", script_path)
         sys.exit(1)
 
-    sitl_direct_tcp = (not use_webots) and (not args.with_mavproxy_consoles)
+    sitl_direct_tcp = (not use_webots) and args.without_mavproxy_consoles
+    use_mavproxy_consoles = (not use_webots) and (not sitl_direct_tcp)
 
     sitl_log_dir = os.path.join(project_root, "logs", "sitl")
     os.makedirs(sitl_log_dir, exist_ok=True)
@@ -987,7 +983,7 @@ Examples:
                 else:
                     p.kill()
         _close_sitl_log_files(sitl_log_files)
-        if not use_webots and args.with_mavproxy_consoles:
+        if use_mavproxy_consoles:
             _pkill_mavproxy_processes()
         sys.exit(1)
 
@@ -1035,7 +1031,7 @@ Examples:
     logger.info("[Scenario] Starting: %s", scenario_desc)
     scenario_cmd = [sys.executable, script_rel, "--drones", str(num_drones)]
     scenario_env = os.environ.copy()
-    if not use_webots and not args.with_mavproxy_consoles:
+    if sitl_direct_tcp:
         scenario_env["DRONE_SWARM_SITL_DIRECT_TCP"] = "1"
     if args.duration > 0:
         scenario_cmd.extend(["--duration", str(args.duration)])
@@ -1080,7 +1076,7 @@ Examples:
     processes.append(scenario_proc)
 
     _sitl_proc_set = frozenset(sitl_procs)
-    _pkill_mavproxy_after_run = bool(not use_webots and args.with_mavproxy_consoles)
+    _pkill_mavproxy_after_run = bool(use_mavproxy_consoles)
 
     def shutdown(signum: Optional[int] = None, frame: Optional[object] = None) -> None:
         logger.info("[Launcher] Stopping processes...")
