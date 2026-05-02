@@ -28,13 +28,13 @@ FOLLOWER_HZ_WINDOW = 20
 START_TIME = 0.0
 
 LEADER_INIT_STEPS = [
-    {"type": "set_mode", "mode_id": 4},
+    {"type": "set_mode", "mode_id": 4}, # GUIDED
     {"type": "sleep", "sec": 0.5},
     {"type": "arm"},
     {"type": "sleep", "sec": 2},
     {"type": "takeoff"},
     {"type": "sleep", "sec": 5},
-    {"type": "set_mode", "mode_id": 16},
+    {"type": "set_mode", "mode_id": 16}, # 2 - ALT_HOLD, 16 - POS_HOLD
     {
         "type": "rc_override",
         "chan1": RC_NEUTRAL,
@@ -149,7 +149,14 @@ class FollowerPIDPursuit:
                         FOLLOWER_HZ_HISTORY
                     )
                 leader_pos = other[self._predecessor_id]
-                self.pid_step_toward(leader_pos, dt=dt_loop)
+                # When --control-hz 0 (no fixed sleep), pass one explicit dt for BOTH PIDs:
+                # dt=None makes each PIDRegulator use wall time, so roll/pitch get different
+                # (tiny) dt within the same step and the follower breaks.
+                if dt_loop is not None:
+                    dt_pid: Optional[float] = dt_loop
+                else:
+                    dt_pid = loop_dt if loop_dt > 1e-6 else 0.02
+                self.pid_step_toward(leader_pos, dt=dt_pid)
                 if dt_loop is not None:
                     time.sleep(dt_loop)
         except KeyboardInterrupt:
@@ -207,13 +214,8 @@ def main() -> None:
         description="Snake pursuit: roll leader +Y + chain followers (snake_pursuit)"
     )
     parser.add_argument("--kp", type=float, default=1.0, help="P gain for follower PID")
-    parser.add_argument(
-        "--ki",
-        type=float,
-        default=0.0,
-        help="I gain for follower PID on both roll and pitch",
-    )
-    parser.add_argument("--kd", type=float, default=0.0, help="D gain")
+    parser.add_argument("--ki", type=float, default=0.0, help="I gain for follower PID")
+    parser.add_argument("--kd", type=float, default=0.0, help="D gain for follower PID")
     parser.add_argument(
         "--derivative-alpha",
         type=float,
@@ -228,7 +230,10 @@ def main() -> None:
         "--control-hz",
         type=float,
         default=50.0,
-        help="Control loop rate in Hz; 0 = no limit",
+        help=(
+            "Follower control loop cap (Hz). 0 = no extra sleep: run as fast as neighbor "
+            "updates allow; PID uses measured loop period as dt (same for roll and pitch)."
+        ),
     )
     parser.add_argument(
         "--leader-roll-pwm",
