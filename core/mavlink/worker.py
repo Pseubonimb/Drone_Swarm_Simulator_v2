@@ -4,10 +4,11 @@ MAVLink worker: single-threaded, thread-safe access to one drone connection.
 All pymavlink operations (recv_match, rc_channels_override_send, set_mode, etc.)
 run in one dedicated thread. Callers use get_position(), get_attitude(),
 send_rc_override() and run_init_sequence() which enqueue commands or read
-from thread-safe state cache.
+from thread-safe state cache (pose from SIM_STATE, NED from lat/lon vs home).
 """
 
 import logging
+import os
 import queue
 import threading
 import time
@@ -15,7 +16,33 @@ from typing import Any, Dict, List, Optional, Union
 
 from pymavlink import mavutil
 
+from core.mavlink.geo_ned import (
+    home_position_lat_lon_alt_m,
+    ned_metres_from_home,
+    sim_state_lat_lon_deg,
+)
+
 logger = logging.getLogger(__name__)
+
+_SIM_STATE_MSG_ID: int = int(
+    getattr(mavutil.mavlink, "MAVLINK_MSG_ID_SIM_STATE", 108)
+)
+_HOME_POSITION_MSG_ID: int = int(
+    getattr(mavutil.mavlink, "MAVLINK_MSG_ID_HOME_POSITION", 242)
+)
+
+
+def _copter_mode_name_from_custom_mode(master: Any, custom_mode: int) -> str:
+    """Resolve ArduCopter ``custom_mode`` from HEARTBEAT to a short mode label."""
+    try:
+        mm = master.mode_mapping()
+        if mm:
+            for name, mid in mm.items():
+                if int(mid) == int(custom_mode):
+                    return str(name).upper()
+    except Exception:
+        pass
+    return f"MODE_{int(custom_mode)}"
 
 # Main thread must not call recv_match / send on mavutil after the worker thread starts;
 # TCP links are especially sensitive to split-thread use.
@@ -23,13 +50,14 @@ logger = logging.getLogger(__name__)
 # Cap recv_msg drain per outer loop iteration so RC/command queue cannot starve indefinitely.
 _MAX_RECV_DRAIN_PER_ITER = 512
 _DEFAULT_TELEMETRY_HZ = 50
+_TIME_SYNC_LOG_ENV = "MAVLINK_TIME_SYNC_LOG_DIR"
 
 
 class MAVLinkWorker:
     """
     Thread-safe MAVLink access for one drone.
 
-    One dedicated thread performs all recv_match() and mav.xxx_send() calls.
+    One dedicated thread performs all recv_msg() / recv and mav.xxx_send() calls.
     Callers send commands via queue; state (position, attitude) is read via
     get_position() / get_attitude() under lock.
     """
@@ -48,11 +76,101 @@ class MAVLinkWorker:
         self._state_lock = threading.Lock()
         self._last_position: Optional[Dict[str, float]] = None
         self._last_attitude: Optional[Dict[str, float]] = None
+        self._last_position_sitl_time_boot_sec: Optional[float] = None
+        self._last_position_py_rx_monotonic_sec: Optional[float] = None
+        self._last_rc_enqueue_py_monotonic_sec: Optional[float] = None
+        self._last_rc_sent_py_monotonic_sec: Optional[float] = None
+        self._last_rc_sent_channels: Optional[Dict[str, int]] = None
+        self._last_hypervisor_rx_to_tx_sec: Optional[float] = None
+        self._pending_sitl_response_tx_py_monotonic_sec: Optional[float] = None
+        self._pending_sitl_response_ref_sitl_time_boot_sec: Optional[float] = None
+        self._last_sitl_cmd_to_response_py_sec: Optional[float] = None
+        self._last_sitl_cmd_to_response_sitl_sec: Optional[float] = None
+        self._last_flight_mode_name: str = ""
+        self._home_lat_deg: float = 0.0
+        self._home_lon_deg: float = 0.0
+        self._home_alt_m: float = 0.0
+        self._home_initialized: bool = False
+        self._home_from_sim_fallback: bool = False
+        # Latest SITL time_boot (s) from any MAVLink message carrying time_boot_ms
+        # (SIM_STATE often omits it; HEARTBEAT keeps a usable clock for cmd->response deltas).
+        self._last_vehicle_sitl_time_boot_sec: Optional[float] = None
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._master: Any = None
         self._bootstrap_ready = threading.Event()
         self._bootstrap_error: Optional[BaseException] = None
+        self._time_sync_log_file: Optional[Any] = None
+        self._init_time_sync_log()
+
+    def _init_time_sync_log(self) -> None:
+        """Open optional CSV log for Python-vs-SITL time mapping."""
+        log_dir = os.environ.get(_TIME_SYNC_LOG_ENV, "").strip()
+        if not log_dir:
+            return
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+            path = os.path.join(log_dir, f"mavlink_time_sync_drone_{self.drone_id}.csv")
+            self._time_sync_log_file = open(path, "w", encoding="utf-8")
+            self._time_sync_log_file.write(
+                "event,drone_id,msg_type,py_monotonic_sec,sitl_time_boot_sec,"
+                "queue_size,chan1,chan2,chan3,chan4\n"
+            )
+            self._time_sync_log_file.flush()
+            logger.info(
+                "MAVLinkWorker time-sync logging enabled for drone %s: %s",
+                self.drone_id,
+                path,
+            )
+        except OSError as exc:
+            logger.warning(
+                "Drone %s: cannot open time-sync log in %r: %s",
+                self.drone_id,
+                log_dir,
+                exc,
+            )
+            self._time_sync_log_file = None
+
+    def _close_time_sync_log(self) -> None:
+        """Close optional time-sync CSV log."""
+        if self._time_sync_log_file is None:
+            return
+        try:
+            self._time_sync_log_file.close()
+        except OSError:
+            pass
+        self._time_sync_log_file = None
+
+    def _write_time_sync_row(
+        self,
+        *,
+        event: str,
+        msg_type: str = "",
+        py_monotonic_sec: float,
+        sitl_time_boot_sec: Optional[float] = None,
+        queue_size: Optional[int] = None,
+        chan1: Optional[int] = None,
+        chan2: Optional[int] = None,
+        chan3: Optional[int] = None,
+        chan4: Optional[int] = None,
+    ) -> None:
+        """Append one row to optional time-sync CSV log."""
+        if self._time_sync_log_file is None:
+            return
+        sitl_str = "" if sitl_time_boot_sec is None else f"{sitl_time_boot_sec:.6f}"
+        queue_str = "" if queue_size is None else str(queue_size)
+        c1 = "" if chan1 is None else str(chan1)
+        c2 = "" if chan2 is None else str(chan2)
+        c3 = "" if chan3 is None else str(chan3)
+        c4 = "" if chan4 is None else str(chan4)
+        try:
+            self._time_sync_log_file.write(
+                f"{event},{self.drone_id},{msg_type},{py_monotonic_sec:.6f},{sitl_str},"
+                f"{queue_str},{c1},{c2},{c3},{c4}\n"
+            )
+            self._time_sync_log_file.flush()
+        except OSError:
+            logger.warning("Drone %s: failed writing time-sync log row", self.drone_id)
 
     def start(self) -> None:
         """Connect (in worker thread), wait for HEARTBEAT, then run the I/O loop."""
@@ -138,35 +256,21 @@ class MAVLinkWorker:
         self._master = None
 
     def _prime_telemetry_streams(self, hz: int = _DEFAULT_TELEMETRY_HZ) -> None:
-        """Request position/attitude streams early (SITL direct TCP often needs legacy + interval)."""
+        """Request HOME_POSITION + SIM_STATE intervals (true sim pose, NED from lat/lon in worker)."""
         if self._master is None:
             return
         m = self._master
         ts, tc = m.target_system, m.target_component
         rate = max(1, min(50, int(hz)))
         interval_us = max(1, int(1e6 / rate))
-        # Legacy REQUEST_DATA_STREAM: ArduPilot still maps POSITION -> LOCAL_POSITION*, etc.
-        m.mav.request_data_stream_send(
-            ts,
-            tc,
-            mavutil.mavlink.MAV_DATA_STREAM_POSITION,
-            rate,
-            1,
-        )
-        m.mav.request_data_stream_send(
-            ts,
-            tc,
-            mavutil.mavlink.MAV_DATA_STREAM_EXTRA1,
-            rate,
-            1,
-        )
+        home_interval_us = max(1, int(5e5))  # 2 Hz: home for NED origin
         m.mav.command_long_send(
             ts,
             tc,
             mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
             0,
-            mavutil.mavlink.MAVLINK_MSG_ID_LOCAL_POSITION_NED,
-            interval_us,
+            _HOME_POSITION_MSG_ID,
+            home_interval_us,
             0,
             0,
             0,
@@ -178,7 +282,7 @@ class MAVLinkWorker:
             tc,
             mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
             0,
-            mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE,
+            _SIM_STATE_MSG_ID,
             interval_us,
             0,
             0,
@@ -194,6 +298,7 @@ class MAVLinkWorker:
             self._thread.join(timeout=2.0)
             self._thread = None
         self._master = None
+        self._close_time_sync_log()
         logger.info("MAVLinkWorker stopped for drone %s", self.drone_id)
 
     def _run_loop(self) -> None:
@@ -218,25 +323,104 @@ class MAVLinkWorker:
                     break
                 drained += 1
                 mt = msg.get_type()
+                py_rx_ts = time.monotonic()
                 if mt == "BAD_DATA":
                     continue
-                if mt == "LOCAL_POSITION_NED":
+                msg_time_boot_ms = getattr(msg, "time_boot_ms", None)
+                sitl_time_boot_sec = (
+                    float(msg_time_boot_ms) / 1000.0
+                    if msg_time_boot_ms is not None
+                    else None
+                )
+                if sitl_time_boot_sec is not None:
+                    self._last_vehicle_sitl_time_boot_sec = sitl_time_boot_sec
+                self._write_time_sync_row(
+                    event="rx",
+                    msg_type=mt,
+                    py_monotonic_sec=py_rx_ts,
+                    sitl_time_boot_sec=sitl_time_boot_sec,
+                    queue_size=self._command_queue.qsize(),
+                )
+                if mt == "HEARTBEAT" and self._master is not None:
+                    try:
+                        cm = int(getattr(msg, "custom_mode", -1))
+                        if cm >= 0:
+                            name = _copter_mode_name_from_custom_mode(self._master, cm)
+                            with self._state_lock:
+                                self._last_flight_mode_name = name
+                    except (TypeError, ValueError):
+                        pass
+                if mt == "HOME_POSITION":
+                    hlat, hlon, halt = home_position_lat_lon_alt_m(msg)
                     with self._state_lock:
+                        self._home_lat_deg = hlat
+                        self._home_lon_deg = hlon
+                        self._home_alt_m = halt
+                        self._home_initialized = True
+                        self._home_from_sim_fallback = False
+                elif mt == "SIM_STATE":
+                    lat, lon = sim_state_lat_lon_deg(msg)
+                    alt_m = float(getattr(msg, "alt", 0.0))
+                    tbm = getattr(msg, "time_boot_ms", None)
+                    if tbm is not None:
+                        sitl_tb = float(tbm) / 1000.0
+                    else:
+                        sitl_tb = self._last_vehicle_sitl_time_boot_sec
+                    with self._state_lock:
+                        if not self._home_initialized:
+                            self._home_lat_deg = lat
+                            self._home_lon_deg = lon
+                            self._home_alt_m = alt_m
+                            self._home_initialized = True
+                            self._home_from_sim_fallback = True
+                            logger.info(
+                                "Drone %s: NED origin latched from first SIM_STATE "
+                                "(HOME_POSITION not yet applied)",
+                                self.drone_id,
+                            )
+                        x, y, z = ned_metres_from_home(
+                            lat,
+                            lon,
+                            alt_m,
+                            self._home_lat_deg,
+                            self._home_lon_deg,
+                            self._home_alt_m,
+                        )
                         self._last_position = {
-                            "x": msg.x,
-                            "y": msg.y,
-                            "z": msg.z,
-                            "vx": getattr(msg, "vx", 0.0),
-                            "vy": getattr(msg, "vy", 0.0),
-                            "vz": getattr(msg, "vz", 0.0),
+                            "x": x,
+                            "y": y,
+                            "z": z,
+                            "vx": float(getattr(msg, "vn", 0.0)),
+                            "vy": float(getattr(msg, "ve", 0.0)),
+                            "vz": float(getattr(msg, "vd", 0.0)),
                         }
-                elif mt == "ATTITUDE":
-                    with self._state_lock:
                         self._last_attitude = {
-                            "rx": msg.roll,
-                            "ry": msg.pitch,
-                            "rz": msg.yaw,
+                            "rx": float(getattr(msg, "roll", 0.0)),
+                            "ry": float(getattr(msg, "pitch", 0.0)),
+                            "rz": float(getattr(msg, "yaw", 0.0)),
                         }
+                        self._last_position_sitl_time_boot_sec = sitl_tb
+                        self._last_position_py_rx_monotonic_sec = py_rx_ts
+                        if (
+                            self._pending_sitl_response_tx_py_monotonic_sec is not None
+                            and py_rx_ts >= self._pending_sitl_response_tx_py_monotonic_sec
+                        ):
+                            self._last_sitl_cmd_to_response_py_sec = (
+                                py_rx_ts - self._pending_sitl_response_tx_py_monotonic_sec
+                            )
+                            if (
+                                sitl_tb is not None
+                                and self._pending_sitl_response_ref_sitl_time_boot_sec
+                                is not None
+                                and sitl_tb
+                                >= self._pending_sitl_response_ref_sitl_time_boot_sec
+                            ):
+                                self._last_sitl_cmd_to_response_sitl_sec = (
+                                    sitl_tb
+                                    - self._pending_sitl_response_ref_sitl_time_boot_sec
+                                )
+                            self._pending_sitl_response_tx_py_monotonic_sec = None
+                            self._pending_sitl_response_ref_sitl_time_boot_sec = None
 
             time.sleep(0.01)
 
@@ -255,6 +439,36 @@ class MAVLinkWorker:
                 0,
                 0,
                 0,
+            )
+            sent_ts = time.monotonic()
+            with self._state_lock:
+                self._last_rc_sent_py_monotonic_sec = sent_ts
+                self._last_rc_sent_channels = {
+                    "chan1": int(cmd["chan1"]),
+                    "chan2": int(cmd["chan2"]),
+                    "chan3": int(cmd["chan3"]),
+                    "chan4": int(cmd["chan4"]),
+                }
+                if (
+                    self._last_position_py_rx_monotonic_sec is not None
+                    and sent_ts >= self._last_position_py_rx_monotonic_sec
+                ):
+                    self._last_hypervisor_rx_to_tx_sec = (
+                        sent_ts - self._last_position_py_rx_monotonic_sec
+                    )
+                self._pending_sitl_response_tx_py_monotonic_sec = sent_ts
+                self._pending_sitl_response_ref_sitl_time_boot_sec = (
+                    self._last_position_sitl_time_boot_sec
+                )
+            self._write_time_sync_row(
+                event="tx_sent_rc_override",
+                msg_type="RC_OVERRIDE",
+                py_monotonic_sec=sent_ts,
+                queue_size=self._command_queue.qsize(),
+                chan1=int(cmd["chan1"]),
+                chan2=int(cmd["chan2"]),
+                chan3=int(cmd["chan3"]),
+                chan4=int(cmd["chan4"]),
             )
         elif cmd_type == "set_mode":
             self._master.set_mode(cmd["mode_id"])
@@ -275,13 +489,13 @@ class MAVLinkWorker:
                 1,
             )
         elif cmd_type == "request_position_stream":
-            interval_us = int(1e6 / cmd.get("hz", 50))
+            interval_us = int(1e6 / max(1, int(cmd.get("hz", 50))))
             self._master.mav.command_long_send(
                 self._master.target_system,
                 self._master.target_component,
                 mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
                 0,
-                mavutil.mavlink.MAVLINK_MSG_ID_LOCAL_POSITION_NED,
+                _SIM_STATE_MSG_ID,
                 interval_us,
                 0,
                 0,
@@ -290,13 +504,13 @@ class MAVLinkWorker:
                 0,
             )
         elif cmd_type == "request_attitude_stream":
-            interval_us = int(1e6 / cmd.get("hz", 50))
+            interval_us = int(1e6 / max(1, int(cmd.get("hz", 50))))
             self._master.mav.command_long_send(
                 self._master.target_system,
                 self._master.target_component,
                 mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
                 0,
-                mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE,
+                _SIM_STATE_MSG_ID,
                 interval_us,
                 0,
                 0,
@@ -329,6 +543,7 @@ class MAVLinkWorker:
             chan4: Yaw.
             controller: Optional; if has last_rc_channels and rc_channels_lock, update them.
         """
+        py_enqueue_ts = time.monotonic()
         try:
             self._command_queue.put_nowait(
                 {
@@ -338,6 +553,18 @@ class MAVLinkWorker:
                     "chan3": chan3,
                     "chan4": chan4,
                 }
+            )
+            with self._state_lock:
+                self._last_rc_enqueue_py_monotonic_sec = py_enqueue_ts
+            self._write_time_sync_row(
+                event="tx_enqueue_rc_override",
+                msg_type="RC_OVERRIDE",
+                py_monotonic_sec=py_enqueue_ts,
+                queue_size=self._command_queue.qsize(),
+                chan1=chan1,
+                chan2=chan2,
+                chan3=chan3,
+                chan4=chan4,
             )
         except queue.Full:
             logger.warning("MAVLinkWorker command queue full, dropping rc_override")
@@ -357,10 +584,12 @@ class MAVLinkWorker:
 
     def get_position(self) -> Optional[Dict[str, float]]:
         """
-        Return last LOCAL_POSITION_NED (x, y, z, vx, vy, vz). Thread-safe.
+        Return last pose from SIM_STATE: NED metres (x,y,z) from home and vn/ve/vd.
+
+        Thread-safe.
 
         Returns:
-            Dict or None if no position received yet.
+            Dict or None if no SIM_STATE received yet.
         """
         with self._state_lock:
             if self._last_position is None:
@@ -369,15 +598,40 @@ class MAVLinkWorker:
 
     def get_attitude(self) -> Optional[Dict[str, float]]:
         """
-        Return last ATTITUDE (roll, pitch, yaw in radians as rx, ry, rz). Thread-safe.
+        Return last roll/pitch/yaw from SIM_STATE (radians as rx, ry, rz). Thread-safe.
 
         Returns:
-            Dict or None if no attitude received yet.
+            Dict or None if no SIM_STATE received yet.
         """
         with self._state_lock:
             if self._last_attitude is None:
                 return None
             return dict(self._last_attitude)
+
+    def get_timing_snapshot(self) -> Dict[str, Any]:
+        """Return thread-safe snapshot of latest MAVLink timing markers and flight mode."""
+        with self._state_lock:
+            snap: Dict[str, Any] = {
+                "last_position_sitl_time_boot_sec": self._last_position_sitl_time_boot_sec,
+                "last_position_py_rx_monotonic_sec": self._last_position_py_rx_monotonic_sec,
+                "last_rc_enqueue_py_monotonic_sec": self._last_rc_enqueue_py_monotonic_sec,
+                "last_rc_sent_py_monotonic_sec": self._last_rc_sent_py_monotonic_sec,
+                "hypervisor_rx_to_tx_sec": self._last_hypervisor_rx_to_tx_sec,
+                "sitl_cmd_to_response_py_sec": self._last_sitl_cmd_to_response_py_sec,
+                "sitl_cmd_to_response_sitl_sec": self._last_sitl_cmd_to_response_sitl_sec,
+                "flight_mode": self._last_flight_mode_name or "",
+            }
+            if self._last_rc_sent_channels is not None:
+                snap["last_rc_sent_chan1"] = float(self._last_rc_sent_channels["chan1"])
+                snap["last_rc_sent_chan2"] = float(self._last_rc_sent_channels["chan2"])
+                snap["last_rc_sent_chan3"] = float(self._last_rc_sent_channels["chan3"])
+                snap["last_rc_sent_chan4"] = float(self._last_rc_sent_channels["chan4"])
+            else:
+                snap["last_rc_sent_chan1"] = None
+                snap["last_rc_sent_chan2"] = None
+                snap["last_rc_sent_chan3"] = None
+                snap["last_rc_sent_chan4"] = None
+            return snap
 
     def run_init_sequence(
         self, steps: List[Dict[str, Any]], timeout: float = 60.0
