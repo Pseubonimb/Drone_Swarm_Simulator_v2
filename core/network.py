@@ -221,6 +221,29 @@ class CoordExchangeManager:
         self._thread: Optional[threading.Thread] = None
         self._webots_last_ts: Dict[int, float] = {}
         self._exchange_hz_history: List[float] = []
+        self._time_sync_step_logs: Dict[int, Any] = {}
+        if self._experiment_dir:
+            os.makedirs(self._experiment_dir, exist_ok=True)
+            for controller in self._controllers:
+                did = int(controller.config["id"])
+                path = os.path.join(
+                    self._experiment_dir, f"drone_{did}_time_sync_steps.csv"
+                )
+                try:
+                    fh = open(path, "w", encoding="utf-8")
+                    fh.write(
+                        "step_idx,t_csv_sec,py_write_wall_sec,py_write_monotonic_sec,"
+                        "sitl_pos_time_boot_sec,last_pos_rx_py_monotonic_sec,"
+                        "last_rc_enqueue_py_monotonic_sec,last_rc_sent_py_monotonic_sec,"
+                        "cmd_to_rx_sec,queue_to_send_sec,cmd_to_csv_write_sec,"
+                        "hypervisor_rx_to_tx_sec,sitl_cmd_to_response_py_sec,sitl_cmd_to_response_sitl_sec,"
+                        "flight_mode,"
+                        "last_rc_sent_chan1,last_rc_sent_chan2,last_rc_sent_chan3,last_rc_sent_chan4\n"
+                    )
+                    fh.flush()
+                    self._time_sync_step_logs[did] = fh
+                except OSError as exc:
+                    logger.warning("Cannot open step time-sync log for drone %s: %s", did, exc)
 
     def set_experiment_start_time(self, t: float) -> None:
         """Set reference time for duration (e.g. global START_TIME in a scenario)."""
@@ -270,6 +293,7 @@ class CoordExchangeManager:
         formation_error_max_run = 0.0
         min_distance_run = float("inf")
         steps_with_collision = 0
+        csv_step_idx = 0
 
         try:
             while not self._stop_event.is_set():
@@ -345,6 +369,9 @@ class CoordExchangeManager:
                         steps_with_collision += 1
                     wrote_this_iter = False
                     if self._experiment_log_files and rate_ok:
+                        csv_step_idx += 1
+                        py_write_wall_sec = now
+                        py_write_monotonic_sec = time.monotonic()
                         for controller in self._controllers:
                             did = int(controller.config["id"])
                             pos = positions[did]
@@ -362,6 +389,76 @@ class CoordExchangeManager:
                                 att["rz"],
                                 hc,
                             )
+                            ts = controller.get_timing_snapshot()
+                            sitl_pos_time_boot_sec = ts.get(
+                                "last_position_sitl_time_boot_sec"
+                            )
+                            last_pos_rx_py = ts.get(
+                                "last_position_py_rx_monotonic_sec"
+                            )
+                            last_rc_enqueue_py = ts.get(
+                                "last_rc_enqueue_py_monotonic_sec"
+                            )
+                            last_rc_sent_py = ts.get(
+                                "last_rc_sent_py_monotonic_sec"
+                            )
+
+                            cmd_to_rx_sec: Optional[float] = None
+                            if (
+                                last_rc_sent_py is not None
+                                and last_pos_rx_py is not None
+                                and last_pos_rx_py >= last_rc_sent_py
+                            ):
+                                cmd_to_rx_sec = last_pos_rx_py - last_rc_sent_py
+
+                            queue_to_send_sec: Optional[float] = None
+                            if (
+                                last_rc_enqueue_py is not None
+                                and last_rc_sent_py is not None
+                                and last_rc_sent_py >= last_rc_enqueue_py
+                            ):
+                                queue_to_send_sec = last_rc_sent_py - last_rc_enqueue_py
+
+                            cmd_to_csv_write_sec: Optional[float] = None
+                            if (
+                                last_rc_sent_py is not None
+                                and py_write_monotonic_sec >= last_rc_sent_py
+                            ):
+                                cmd_to_csv_write_sec = (
+                                    py_write_monotonic_sec - last_rc_sent_py
+                                )
+
+                            step_log = self._time_sync_step_logs.get(did)
+                            if step_log is not None:
+                                def _fmt(val: Optional[float], precision: int = 6) -> str:
+                                    return "" if val is None else f"{val:.{precision}f}"
+
+                                def _fmt_mode(raw: Any) -> str:
+                                    s = str(raw or "").replace(",", ";").replace("\n", " ")
+                                    return s.replace("\r", "")
+
+                                step_log.write(
+                                    f"{csv_step_idx},"
+                                    f"{t_elapsed:.6f},"
+                                    f"{py_write_wall_sec:.6f},"
+                                    f"{py_write_monotonic_sec:.6f},"
+                                    f"{_fmt(sitl_pos_time_boot_sec)},"
+                                    f"{_fmt(last_pos_rx_py)},"
+                                    f"{_fmt(last_rc_enqueue_py)},"
+                                    f"{_fmt(last_rc_sent_py)},"
+                                    f"{_fmt(cmd_to_rx_sec)},"
+                                    f"{_fmt(queue_to_send_sec)},"
+                                    f"{_fmt(cmd_to_csv_write_sec)},"
+                                    f"{_fmt(ts.get('hypervisor_rx_to_tx_sec'))},"
+                                    f"{_fmt(ts.get('sitl_cmd_to_response_py_sec'))},"
+                                    f"{_fmt(ts.get('sitl_cmd_to_response_sitl_sec'))},"
+                                    f"{_fmt_mode(ts.get('flight_mode'))},"
+                                    f"{_fmt(ts.get('last_rc_sent_chan1'), 0)},"
+                                    f"{_fmt(ts.get('last_rc_sent_chan2'), 0)},"
+                                    f"{_fmt(ts.get('last_rc_sent_chan3'), 0)},"
+                                    f"{_fmt(ts.get('last_rc_sent_chan4'), 0)}\n"
+                                )
+                                step_log.flush()
                             wrote_this_iter = True
                     if wrote_this_iter:
                         last_csv_log_time = now
@@ -390,6 +487,11 @@ class CoordExchangeManager:
                         f.close()
                     except Exception:
                         pass
+            for _, f in self._time_sync_step_logs.items():
+                try:
+                    f.close()
+                except Exception:
+                    pass
             if self._experiment_dir:
                 min_dist_final = (
                     min_distance_run
