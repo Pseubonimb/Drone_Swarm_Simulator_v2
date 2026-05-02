@@ -143,7 +143,7 @@ class DroneController:
         return {"rx": att["rx"], "ry": att["ry"], "rz": att["rz"]}
 
     def get_velocity(self) -> Dict[str, float]:
-        """Return current NED velocity (vx, vy, vz) in m/s from LOCAL_POSITION_NED cache."""
+        """Return NED velocity (vx, vy, vz) in m/s from last SIM_STATE (vn, ve, vd)."""
         if self.worker is None:
             return dict(_DEFAULT_VELOCITY)
         pos = self.worker.get_position()
@@ -154,6 +154,25 @@ class DroneController:
             "vy": pos.get("vy", 0.0),
             "vz": pos.get("vz", 0.0),
         }
+
+    def get_timing_snapshot(self) -> Dict[str, Any]:
+        """Return latest MAVLink timing markers from worker (thread-safe copy)."""
+        if self.worker is None:
+            return {
+                "last_position_sitl_time_boot_sec": None,
+                "last_position_py_rx_monotonic_sec": None,
+                "last_rc_enqueue_py_monotonic_sec": None,
+                "last_rc_sent_py_monotonic_sec": None,
+                "hypervisor_rx_to_tx_sec": None,
+                "sitl_cmd_to_response_py_sec": None,
+                "sitl_cmd_to_response_sitl_sec": None,
+                "flight_mode": "",
+                "last_rc_sent_chan1": None,
+                "last_rc_sent_chan2": None,
+                "last_rc_sent_chan3": None,
+                "last_rc_sent_chan4": None,
+            }
+        return self.worker.get_timing_snapshot()
 
     def get_relative_position(self, target_position: Dict[str, float]) -> Dict[str, float]:
         """Relative position to target (target - self) in meters (NED x, y, z)."""
