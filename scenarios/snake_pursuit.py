@@ -18,6 +18,7 @@ if _project_root not in sys.path:
 from core.control import DroneController, PIDRegulator  # noqa: E402
 from core.logging.csv_logger import CSV_HEADER, write_metadata  # noqa: E402
 from core.mavlink.utils import RC_NEUTRAL, sitl_tcp_connection_string  # noqa: E402
+from core.mavlink.worker import recommended_init_barrier_timeout_sec  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -378,7 +379,7 @@ def main() -> None:
             daemon=False,
         ).start()
     try:
-        init_barrier.wait(timeout=120)
+        init_barrier.wait(timeout=recommended_init_barrier_timeout_sec())
     except threading.BrokenBarrierError:
         return
     time.sleep(2)

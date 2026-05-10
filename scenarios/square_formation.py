@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 from core.control import DroneController, PIDRegulator
 from core.mavlink.utils import RC_NEUTRAL, sitl_tcp_connection_string
+from core.mavlink.worker import recommended_init_barrier_timeout_sec
 from core.network import CoordExchangeStepContext
 
 # Square step commands (roll, pitch, throttle, yaw)
@@ -309,7 +310,7 @@ def main() -> None:
             daemon=False,
         ).start()
     try:
-        init_barrier.wait(timeout=120)
+        init_barrier.wait(timeout=recommended_init_barrier_timeout_sec())
     except threading.BrokenBarrierError:
         return
     time.sleep(2)
