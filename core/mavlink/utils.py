@@ -6,6 +6,8 @@ from typing import Any, Optional
 
 from pymavlink import mavutil
 
+from core.mavlink.telemetry_mode import telemetry_uses_sim_state
+
 # Neutral PWM value for RC channels (roll, pitch, throttle, yaw).
 RC_NEUTRAL: int = 1500
 
@@ -69,21 +71,25 @@ def _sim_state_msg_id() -> int:
 
 def request_position_stream_rate(master: Any, hz: int = 50) -> None:
     """
-    Request SIM_STATE at the given rate (true sim pose; lat/lon converted to NED in worker).
-
-    Kept for API compatibility with scenarios that call ``request_position_stream``.
+    Request position telemetry: ``SIM_STATE`` or ``LOCAL_POSITION_NED`` interval per
+    ``MAVLINK_TELEMETRY_MODE`` (same as ``MAVLinkWorker``).
 
     Args:
         master: MAVLink connection (mavutil.mavlink_connection).
         hz: Desired frequency in Hz (default 50).
     """
     interval_us = int(1e6 / max(1, hz))
+    msg_id = (
+        _sim_state_msg_id()
+        if telemetry_uses_sim_state()
+        else int(mavutil.mavlink.MAVLINK_MSG_ID_LOCAL_POSITION_NED)
+    )
     master.mav.command_long_send(
         master.target_system,
         master.target_component,
         mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
         0,
-        _sim_state_msg_id(),
+        msg_id,
         interval_us,
         0,
         0,
@@ -95,12 +101,27 @@ def request_position_stream_rate(master: Any, hz: int = 50) -> None:
 
 def request_attitude_stream_rate(master: Any, hz: int = 50) -> None:
     """
-    Request SIM_STATE at the given rate (roll/pitch/yaw come from the same message).
-
-    Kept for API compatibility with scenarios that call ``request_attitude_stream``.
+    Request attitude: ``SIM_STATE`` (shared with position) or ``ATTITUDE`` per
+    ``MAVLINK_TELEMETRY_MODE``.
 
     Args:
         master: MAVLink connection (mavutil.mavlink_connection).
         hz: Desired frequency in Hz (default 50).
     """
-    request_position_stream_rate(master, hz=hz)
+    if telemetry_uses_sim_state():
+        request_position_stream_rate(master, hz=hz)
+        return
+    interval_us = int(1e6 / max(1, hz))
+    master.mav.command_long_send(
+        master.target_system,
+        master.target_component,
+        mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+        0,
+        mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE,
+        interval_us,
+        0,
+        0,
+        0,
+        0,
+        0,
+    )

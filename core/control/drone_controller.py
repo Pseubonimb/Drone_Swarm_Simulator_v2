@@ -143,7 +143,7 @@ class DroneController:
         return {"rx": att["rx"], "ry": att["ry"], "rz": att["rz"]}
 
     def get_velocity(self) -> Dict[str, float]:
-        """Return NED velocity (vx, vy, vz) in m/s from last SIM_STATE (vn, ve, vd)."""
+        """Return NED velocity (vx, vy, vz) in m/s from worker (LOCAL or SIM_STATE cache)."""
         if self.worker is None:
             return dict(_DEFAULT_VELOCITY)
         pos = self.worker.get_position()

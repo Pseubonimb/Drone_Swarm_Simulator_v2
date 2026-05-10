@@ -4,7 +4,8 @@ MAVLink worker: single-threaded, thread-safe access to one drone connection.
 All pymavlink operations (recv_match, rc_channels_override_send, set_mode, etc.)
 run in one dedicated thread. Callers use get_position(), get_attitude(),
 send_rc_override() and run_init_sequence() which enqueue commands or read
-from thread-safe state cache (pose from SIM_STATE, NED from lat/lon vs home).
+from thread-safe state cache. Pose source: ``MAVLINK_TELEMETRY_MODE`` — see ``core.mavlink.telemetry_mode.telemetry_uses_sim_state``
+(default: SIM_STATE + HOME_POSITION; set ``local`` for LOCAL_POSITION_NED + ATTITUDE).
 """
 
 import logging
@@ -21,6 +22,7 @@ from core.mavlink.geo_ned import (
     ned_metres_from_home,
     sim_state_lat_lon_deg,
 )
+from core.mavlink.telemetry_mode import telemetry_uses_sim_state
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +53,26 @@ def _copter_mode_name_from_custom_mode(master: Any, custom_mode: int) -> str:
 _MAX_RECV_DRAIN_PER_ITER = 512
 _DEFAULT_TELEMETRY_HZ = 50
 _TIME_SYNC_LOG_ENV = "MAVLINK_TIME_SYNC_LOG_DIR"
+_CONNECT_TIMEOUT_ENV = "MAVLINK_WORKER_CONNECT_TIMEOUT_SEC"
+
+
+def connect_bootstrap_timeout_sec() -> float:
+    """Seconds for MAVLink worker bootstrap until HEARTBEAT (cold SITL build often exceeds 120s).
+
+    Set ``MAVLINK_WORKER_CONNECT_TIMEOUT_SEC`` (clamped to 30..7200).
+    """
+    raw = (os.environ.get(_CONNECT_TIMEOUT_ENV) or "").strip()
+    if raw:
+        try:
+            return max(30.0, min(float(raw), 7200.0))
+        except ValueError:
+            logger.warning("Invalid %s=%r; using default", _CONNECT_TIMEOUT_ENV, raw)
+    return 420.0
+
+
+def recommended_init_barrier_timeout_sec() -> float:
+    """Scenario ``Barrier`` deadline: bootstrap on all drones + arm/takeoff init."""
+    return connect_bootstrap_timeout_sec() + 180.0
 
 
 class MAVLinkWorker:
@@ -95,6 +117,7 @@ class MAVLinkWorker:
         # Latest SITL time_boot (s) from any MAVLink message carrying time_boot_ms
         # (SIM_STATE often omits it; HEARTBEAT keeps a usable clock for cmd->response deltas).
         self._last_vehicle_sitl_time_boot_sec: Optional[float] = None
+        self._telemetry_sim_state: bool = telemetry_uses_sim_state()
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._master: Any = None
@@ -184,7 +207,13 @@ class MAVLinkWorker:
         self._thread = threading.Thread(target=self._bootstrap_and_run, daemon=True)
         self._thread.start()
 
-        connect_timeout = 120.0
+        connect_timeout = connect_bootstrap_timeout_sec()
+        logger.info(
+            "Drone %s MAVLink bootstrap waiting up to %.0f s (%s; first SITL build may need more)",
+            self.drone_id,
+            connect_timeout,
+            _CONNECT_TIMEOUT_ENV,
+        )
         if not self._bootstrap_ready.wait(timeout=connect_timeout):
             self._running = False
             self._thread.join(timeout=3.0)
@@ -239,6 +268,14 @@ class MAVLinkWorker:
                 exc,
             )
 
+        logger.info(
+            "Drone %s MAVLink telemetry source: %s",
+            self.drone_id,
+            "SIM_STATE+HOME_POSITION"
+            if self._telemetry_sim_state
+            else "LOCAL_POSITION_NED+ATTITUDE",
+        )
+
         self._running = True
         self._bootstrap_ready.set()
         try:
@@ -256,21 +293,63 @@ class MAVLinkWorker:
         self._master = None
 
     def _prime_telemetry_streams(self, hz: int = _DEFAULT_TELEMETRY_HZ) -> None:
-        """Request HOME_POSITION + SIM_STATE intervals (true sim pose, NED from lat/lon in worker)."""
+        """Request telemetry streams per ``MAVLINK_TELEMETRY_MODE`` (``telemetry_mode`` module)."""
         if self._master is None:
             return
         m = self._master
         ts, tc = m.target_system, m.target_component
         rate = max(1, min(50, int(hz)))
         interval_us = max(1, int(1e6 / rate))
-        home_interval_us = max(1, int(5e5))  # 2 Hz: home for NED origin
+        if self._telemetry_sim_state:
+            home_interval_us = max(1, int(5e5))  # 2 Hz: home for NED origin
+            m.mav.command_long_send(
+                ts,
+                tc,
+                mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                0,
+                _HOME_POSITION_MSG_ID,
+                home_interval_us,
+                0,
+                0,
+                0,
+                0,
+                0,
+            )
+            m.mav.command_long_send(
+                ts,
+                tc,
+                mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                0,
+                _SIM_STATE_MSG_ID,
+                interval_us,
+                0,
+                0,
+                0,
+                0,
+                0,
+            )
+            return
+        m.mav.request_data_stream_send(
+            ts,
+            tc,
+            mavutil.mavlink.MAV_DATA_STREAM_POSITION,
+            rate,
+            1,
+        )
+        m.mav.request_data_stream_send(
+            ts,
+            tc,
+            mavutil.mavlink.MAV_DATA_STREAM_EXTRA1,
+            rate,
+            1,
+        )
         m.mav.command_long_send(
             ts,
             tc,
             mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
             0,
-            _HOME_POSITION_MSG_ID,
-            home_interval_us,
+            mavutil.mavlink.MAVLINK_MSG_ID_LOCAL_POSITION_NED,
+            interval_us,
             0,
             0,
             0,
@@ -282,7 +361,7 @@ class MAVLinkWorker:
             tc,
             mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
             0,
-            _SIM_STATE_MSG_ID,
+            mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE,
             interval_us,
             0,
             0,
@@ -350,77 +429,123 @@ class MAVLinkWorker:
                                 self._last_flight_mode_name = name
                     except (TypeError, ValueError):
                         pass
-                if mt == "HOME_POSITION":
-                    hlat, hlon, halt = home_position_lat_lon_alt_m(msg)
-                    with self._state_lock:
-                        self._home_lat_deg = hlat
-                        self._home_lon_deg = hlon
-                        self._home_alt_m = halt
-                        self._home_initialized = True
-                        self._home_from_sim_fallback = False
-                elif mt == "SIM_STATE":
-                    lat, lon = sim_state_lat_lon_deg(msg)
-                    alt_m = float(getattr(msg, "alt", 0.0))
-                    tbm = getattr(msg, "time_boot_ms", None)
-                    if tbm is not None:
-                        sitl_tb = float(tbm) / 1000.0
-                    else:
-                        sitl_tb = self._last_vehicle_sitl_time_boot_sec
-                    with self._state_lock:
-                        if not self._home_initialized:
-                            self._home_lat_deg = lat
-                            self._home_lon_deg = lon
-                            self._home_alt_m = alt_m
+                if self._telemetry_sim_state:
+                    if mt == "HOME_POSITION":
+                        hlat, hlon, halt = home_position_lat_lon_alt_m(msg)
+                        with self._state_lock:
+                            self._home_lat_deg = hlat
+                            self._home_lon_deg = hlon
+                            self._home_alt_m = halt
                             self._home_initialized = True
-                            self._home_from_sim_fallback = True
-                            logger.info(
-                                "Drone %s: NED origin latched from first SIM_STATE "
-                                "(HOME_POSITION not yet applied)",
-                                self.drone_id,
-                            )
-                        x, y, z = ned_metres_from_home(
-                            lat,
-                            lon,
-                            alt_m,
-                            self._home_lat_deg,
-                            self._home_lon_deg,
-                            self._home_alt_m,
-                        )
-                        self._last_position = {
-                            "x": x,
-                            "y": y,
-                            "z": z,
-                            "vx": float(getattr(msg, "vn", 0.0)),
-                            "vy": float(getattr(msg, "ve", 0.0)),
-                            "vz": float(getattr(msg, "vd", 0.0)),
-                        }
-                        self._last_attitude = {
-                            "rx": float(getattr(msg, "roll", 0.0)),
-                            "ry": float(getattr(msg, "pitch", 0.0)),
-                            "rz": float(getattr(msg, "yaw", 0.0)),
-                        }
-                        self._last_position_sitl_time_boot_sec = sitl_tb
-                        self._last_position_py_rx_monotonic_sec = py_rx_ts
-                        if (
-                            self._pending_sitl_response_tx_py_monotonic_sec is not None
-                            and py_rx_ts >= self._pending_sitl_response_tx_py_monotonic_sec
-                        ):
-                            self._last_sitl_cmd_to_response_py_sec = (
-                                py_rx_ts - self._pending_sitl_response_tx_py_monotonic_sec
-                            )
-                            if (
-                                sitl_tb is not None
-                                and self._pending_sitl_response_ref_sitl_time_boot_sec
-                                is not None
-                                and sitl_tb
-                                >= self._pending_sitl_response_ref_sitl_time_boot_sec
-                            ):
-                                self._last_sitl_cmd_to_response_sitl_sec = (
-                                    sitl_tb
-                                    - self._pending_sitl_response_ref_sitl_time_boot_sec
+                            self._home_from_sim_fallback = False
+                    elif mt == "SIM_STATE":
+                        lat, lon = sim_state_lat_lon_deg(msg)
+                        alt_m = float(getattr(msg, "alt", 0.0))
+                        tbm = getattr(msg, "time_boot_ms", None)
+                        if tbm is not None:
+                            sitl_tb = float(tbm) / 1000.0
+                        else:
+                            sitl_tb = self._last_vehicle_sitl_time_boot_sec
+                        with self._state_lock:
+                            if not self._home_initialized:
+                                self._home_lat_deg = lat
+                                self._home_lon_deg = lon
+                                self._home_alt_m = alt_m
+                                self._home_initialized = True
+                                self._home_from_sim_fallback = True
+                                logger.info(
+                                    "Drone %s: NED origin latched from first SIM_STATE "
+                                    "(HOME_POSITION not yet applied)",
+                                    self.drone_id,
                                 )
-                            self._pending_sitl_response_tx_py_monotonic_sec = None
-                            self._pending_sitl_response_ref_sitl_time_boot_sec = None
+                            x, y, z = ned_metres_from_home(
+                                lat,
+                                lon,
+                                alt_m,
+                                self._home_lat_deg,
+                                self._home_lon_deg,
+                                self._home_alt_m,
+                            )
+                            self._last_position = {
+                                "x": x,
+                                "y": y,
+                                "z": z,
+                                "vx": float(getattr(msg, "vn", 0.0)),
+                                "vy": float(getattr(msg, "ve", 0.0)),
+                                "vz": float(getattr(msg, "vd", 0.0)),
+                            }
+                            self._last_attitude = {
+                                "rx": float(getattr(msg, "roll", 0.0)),
+                                "ry": float(getattr(msg, "pitch", 0.0)),
+                                "rz": float(getattr(msg, "yaw", 0.0)),
+                            }
+                            self._last_position_sitl_time_boot_sec = sitl_tb
+                            self._last_position_py_rx_monotonic_sec = py_rx_ts
+                            if (
+                                self._pending_sitl_response_tx_py_monotonic_sec is not None
+                                and py_rx_ts
+                                >= self._pending_sitl_response_tx_py_monotonic_sec
+                            ):
+                                self._last_sitl_cmd_to_response_py_sec = (
+                                    py_rx_ts
+                                    - self._pending_sitl_response_tx_py_monotonic_sec
+                                )
+                                if (
+                                    sitl_tb is not None
+                                    and self._pending_sitl_response_ref_sitl_time_boot_sec
+                                    is not None
+                                    and sitl_tb
+                                    >= self._pending_sitl_response_ref_sitl_time_boot_sec
+                                ):
+                                    self._last_sitl_cmd_to_response_sitl_sec = (
+                                        sitl_tb
+                                        - self._pending_sitl_response_ref_sitl_time_boot_sec
+                                    )
+                                self._pending_sitl_response_tx_py_monotonic_sec = None
+                                self._pending_sitl_response_ref_sitl_time_boot_sec = None
+                else:
+                    if mt == "LOCAL_POSITION_NED":
+                        with self._state_lock:
+                            self._last_position = {
+                                "x": msg.x,
+                                "y": msg.y,
+                                "z": msg.z,
+                                "vx": float(getattr(msg, "vx", 0.0)),
+                                "vy": float(getattr(msg, "vy", 0.0)),
+                                "vz": float(getattr(msg, "vz", 0.0)),
+                            }
+                            self._last_position_sitl_time_boot_sec = sitl_time_boot_sec
+                            self._last_position_py_rx_monotonic_sec = py_rx_ts
+                            if (
+                                self._pending_sitl_response_tx_py_monotonic_sec
+                                is not None
+                                and py_rx_ts
+                                >= self._pending_sitl_response_tx_py_monotonic_sec
+                            ):
+                                self._last_sitl_cmd_to_response_py_sec = (
+                                    py_rx_ts
+                                    - self._pending_sitl_response_tx_py_monotonic_sec
+                                )
+                                if (
+                                    sitl_time_boot_sec is not None
+                                    and self._pending_sitl_response_ref_sitl_time_boot_sec
+                                    is not None
+                                    and sitl_time_boot_sec
+                                    >= self._pending_sitl_response_ref_sitl_time_boot_sec
+                                ):
+                                    self._last_sitl_cmd_to_response_sitl_sec = (
+                                        sitl_time_boot_sec
+                                        - self._pending_sitl_response_ref_sitl_time_boot_sec
+                                    )
+                                self._pending_sitl_response_tx_py_monotonic_sec = None
+                                self._pending_sitl_response_ref_sitl_time_boot_sec = None
+                    elif mt == "ATTITUDE":
+                        with self._state_lock:
+                            self._last_attitude = {
+                                "rx": float(msg.roll),
+                                "ry": float(msg.pitch),
+                                "rz": float(msg.yaw),
+                            }
 
             time.sleep(0.01)
 
@@ -490,12 +615,17 @@ class MAVLinkWorker:
             )
         elif cmd_type == "request_position_stream":
             interval_us = int(1e6 / max(1, int(cmd.get("hz", 50))))
+            msg_id = (
+                _SIM_STATE_MSG_ID
+                if self._telemetry_sim_state
+                else mavutil.mavlink.MAVLINK_MSG_ID_LOCAL_POSITION_NED
+            )
             self._master.mav.command_long_send(
                 self._master.target_system,
                 self._master.target_component,
                 mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
                 0,
-                _SIM_STATE_MSG_ID,
+                msg_id,
                 interval_us,
                 0,
                 0,
@@ -505,19 +635,34 @@ class MAVLinkWorker:
             )
         elif cmd_type == "request_attitude_stream":
             interval_us = int(1e6 / max(1, int(cmd.get("hz", 50))))
-            self._master.mav.command_long_send(
-                self._master.target_system,
-                self._master.target_component,
-                mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
-                0,
-                _SIM_STATE_MSG_ID,
-                interval_us,
-                0,
-                0,
-                0,
-                0,
-                0,
-            )
+            if self._telemetry_sim_state:
+                self._master.mav.command_long_send(
+                    self._master.target_system,
+                    self._master.target_component,
+                    mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                    0,
+                    _SIM_STATE_MSG_ID,
+                    interval_us,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+            else:
+                self._master.mav.command_long_send(
+                    self._master.target_system,
+                    self._master.target_component,
+                    mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                    0,
+                    mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE,
+                    interval_us,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
         elif cmd_type == "sleep":
             time.sleep(cmd.get("sec", 0))
         elif cmd_type == "init_done":
@@ -584,12 +729,12 @@ class MAVLinkWorker:
 
     def get_position(self) -> Optional[Dict[str, float]]:
         """
-        Return last pose from SIM_STATE: NED metres (x,y,z) from home and vn/ve/vd.
+        Return last NED position (and velocities) from SIM_STATE or LOCAL_POSITION_NED.
 
         Thread-safe.
 
         Returns:
-            Dict or None if no SIM_STATE received yet.
+            Dict or None if no pose message received yet.
         """
         with self._state_lock:
             if self._last_position is None:
@@ -598,10 +743,12 @@ class MAVLinkWorker:
 
     def get_attitude(self) -> Optional[Dict[str, float]]:
         """
-        Return last roll/pitch/yaw from SIM_STATE (radians as rx, ry, rz). Thread-safe.
+        Return last roll/pitch/yaw from SIM_STATE or ATTITUDE (radians as rx, ry, rz).
+
+        Thread-safe.
 
         Returns:
-            Dict or None if no SIM_STATE received yet.
+            Dict or None if no attitude source received yet.
         """
         with self._state_lock:
             if self._last_attitude is None:
@@ -661,4 +808,5 @@ class MAVLinkWorker:
             self._command_queue.put_nowait({"type": "init_done", "event": evt})
         except queue.Full:
             return False
-        return evt.wait(timeout=timeout)
+        ok = evt.wait(timeout=timeout)
+        return ok
