@@ -80,6 +80,37 @@ python run_batch.py --runs 3 --drones 2 --duration 60 --scenario leader_forward_
 
 ---
 
+## Сборка ArduPilot SITL
+
+Лаунчер `launch_simulation.py` вызывает `Tools/autotest/sim_vehicle.py` из **соседнего** каталога **`../ardupilot`** относительно корня этого репозитория. Убедитесь, что ArduPilot там лежит (клонируйте [ardupilot/ardupilot](https://github.com/ArduPilot/ardupilot) или свой форк рядом с `Drone_Swarm_Simulator_v2`).
+
+**Первый раз** (или после смены ветки / правок C++) соберите бинарный файл SITL для Copter в дереве ArduPilot:
+
+```bash
+cd /path/to/ardupilot
+# при необходимости используйте python из drone_env этого проекта (есть empy и т.п.)
+/path/to/Drone_Swarm_Simulator_v2/drone_env/bin/python waf configure --board sitl
+/path/to/Drone_Swarm_Simulator_v2/drone_env/bin/python waf copter
+```
+
+Цель сборки должна появиться в каталоге вроде `build/sitl/bin/` (файлы с префиксом `ardu`).
+
+**При каждом запуске симуляции лаунчер по умолчанию передаёт `sim_vehicle` флаг `-N`** (nested waf **не вызывается**). Повторные прогоны `python launch_simulation.py …` после одной успешной сборки **не пересобирают** автопилот.
+
+Если нужно **пересобрать** из окружения лаунчера (редко):
+
+```bash
+python launch_simulation.py … --sitl-rebuild-waf
+# или один раз перед запуском:
+export DRONE_SWARM_SITL_ALLOW_WAF_REBUILD=1
+```
+
+Флаг `--sitl-no-rebuild` сохранён для совместимости со старыми скриптами и при актуальных умолчаниях не обязателен.
+
+Экстра **CXXFLAGS** для трассировок задержек в SITL и прочее — см. **`docs/Real-time_MAVLink.md`** (§9 и §9.5).
+
+---
+
 ## Серия экспериментов: `launch_simulation.py --batch-params` (YAML)
 
 Последовательный запуск комбинаций параметров из YAML (SITL-only, без `--webots`). Результаты: `experiments/<ГГГГ-ММ-ДД_ЧЧ-ММ-СС>/batch_<id>_run_<n>/` (`batch_run.json`, `metadata.json`, `drone_*.csv`).
@@ -103,8 +134,11 @@ python launch_simulation.py -s --batch-params scenarios/batch_parameters/ofat_sn
 | `--duration` | `30` | Длительность одного прогона (с); при `0` в CLI берётся из YAML |
 | `--param-file` | `config/iris.parm` | Параметры ArduPilot (по умолчанию из лаунчера) |
 | `--exchange-hz` | `50` | Частота контура обмена координатами / логирования |
-| `--kp`, `--ki`, `--kd`, `--derivative-alpha` | числа | Фиксация PID для OFAT, если соответствующая ось **не** в текущем sweep (`leader_forward_back`, `snake_pursuit`) |
+| `--kp`, `--ki`, `--kd`, `--derivative-alpha` | числа | OFAT: фиксация PID, если ось не в sweep (`leader_forward_back`, `snake_pursuit`, `task_assignment_decentralized`) |
+| `--num-targets`, `--target-radius-m`, `--target-center-x`, `--target-center-y` | … | Только `task_assignment_decentralized` в батче (если соответствующие оси не в YAML) |
 | `--leader-roll-pwm` | `1600` | Только `snake_pursuit` / `snake_distance_ground_follower` |
+
+Пример серии для назначения целей без отдельных скриптов: **`scenarios/batch_parameters/task_assignment_fixed_targets_sweep.yaml`**.
 
 OFAT-примеры и порядок этапов: **`scenarios/batch_parameters/ofat_snake_pursuit/README.md`**, методика: **`scenarios/batch_parameters/METHODOLOGY_batch_experiments_and_pid_tuning.md`**.
 
