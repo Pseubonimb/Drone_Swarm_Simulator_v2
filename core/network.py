@@ -185,6 +185,8 @@ class CoordExchangeManager:
         update_neighbors: bool = True,
         publish_visualizer: bool = True,
         publish_measured_exchange_hz: bool = True,
+        visualizer_extra: Optional[Dict[str, Any]] = None,
+        visualizer_extra_lock: Optional[threading.Lock] = None,
         on_step: Optional[Callable[[CoordExchangeStepContext], None]] = None,
         daemon: bool = True,
     ) -> None:
@@ -207,6 +209,8 @@ class CoordExchangeManager:
         self._update_neighbors = update_neighbors
         self._publish_visualizer = publish_visualizer
         self._publish_measured_exchange_hz = publish_measured_exchange_hz
+        self._visualizer_extra = visualizer_extra
+        self._visualizer_extra_lock = visualizer_extra_lock
         self._on_step = on_step
         self._daemon = daemon
 
@@ -328,7 +332,23 @@ class CoordExchangeManager:
 
                 if self._publish_visualizer and _publish_positions is not None:
                     try:
-                        _publish_positions(positions, rates=self.rates_shared)
+                        kwargs: Dict[str, Any] = {"rates": self.rates_shared}
+                        ex = self._visualizer_extra
+                        if ex is not None:
+                            if self._visualizer_extra_lock is not None:
+                                with self._visualizer_extra_lock:
+                                    tg = ex.get("targets")
+                                    if tg is not None:
+                                        kwargs["targets"] = tg
+                                    png = ex.pop("pending_png", None)
+                            else:
+                                tg = ex.get("targets")
+                                if tg is not None:
+                                    kwargs["targets"] = tg
+                                png = ex.pop("pending_png", None)
+                            if png:
+                                kwargs["save_png"] = png
+                        _publish_positions(positions, **kwargs)
                     except Exception:
                         pass
 
