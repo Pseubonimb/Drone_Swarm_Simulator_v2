@@ -4,11 +4,13 @@ Publish drone positions to the 2D visualizer over UDP.
 
 Scenarios call publish_positions() from the coordinate exchange loop.
 Format: positions = {drone_id: {"x": float, "y": float, "z": float}, ...}
+Optional: targets = [{"x","y","z"}, ...] (e.g. assignment waypoints) and save_png path
+for one-shot figure export in the visualizer process.
 Failures are suppressed so the simulation continues if the visualizer is not running.
 """
 import json
 import socket
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 DEFAULT_VISUALIZER_PORT = 15551
 
@@ -18,6 +20,8 @@ def publish_positions(
     host: str = "127.0.0.1",
     port: int = DEFAULT_VISUALIZER_PORT,
     rates: Optional[Dict[str, Optional[float]]] = None,
+    targets: Optional[List[Dict[str, float]]] = None,
+    save_png: Optional[str] = None,
 ) -> None:
     """Send current drone positions to the visualizer via UDP.
 
@@ -26,6 +30,8 @@ def publish_positions(
         host: Visualizer host (default 127.0.0.1).
         port: Visualizer UDP port (default 15551).
         rates: Optional {"follower_hz", "exchange_hz", "webots_step_hz"} for display.
+        targets: Optional list of {"x", "y", "z"} in the same NED common frame (shown as crosses).
+        save_png: If set, visualizer saves the current figure to this path once when received.
 
     Returns:
         None.
@@ -33,7 +39,7 @@ def publish_positions(
     Note:
         Does not raise; if the visualizer is not running, packets are dropped silently.
     """
-    if not positions and not rates:
+    if not positions and not rates and not targets and not save_png:
         return
     try:
         payload_dict: Dict[str, Any] = {}
@@ -48,6 +54,17 @@ def publish_positions(
                 "exchange_hz": rates.get("exchange_hz"),
                 "webots_step_hz": rates.get("webots_step_hz"),
             }
+        if targets:
+            payload_dict["targets"] = [
+                {
+                    "x": float(p.get("x", 0)),
+                    "y": float(p.get("y", 0)),
+                    "z": float(p.get("z", 0)),
+                }
+                for p in targets
+            ]
+        if save_png:
+            payload_dict["save_png"] = str(save_png)
         payload = json.dumps(payload_dict).encode("utf-8")
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:

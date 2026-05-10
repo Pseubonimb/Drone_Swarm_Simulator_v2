@@ -40,6 +40,8 @@ python launch_simulation.py -s -c leader_forward_back --with-2d-visualizer
 
 The launcher starts the 2D visualizer as a subprocess before the scenario. Scenarios that support it (e.g. `leader_forward_back`) call `publish_positions()` from the coordinate exchange loop to send NED positions to the visualizer.
 
+The UDP JSON may also include **`targets`** (list of `{"x","y","z"}` in the same common NED frame) — the live plot draws them as **+** markers; and optional **`save_png`** (file path) to save the current figure on the next redraw (used together with headless `viz_*.png` exports in `task_assignment_decentralized` when the launcher sets `DRONE_SWARM_WITH_2D_VIZ=1`).
+
 ### Live parameters
 
 | Option       | Default | Description                    |

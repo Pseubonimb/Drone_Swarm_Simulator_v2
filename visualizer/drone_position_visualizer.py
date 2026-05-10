@@ -6,6 +6,9 @@ Receives NED coordinates via UDP from scenarios (via position_publisher).
 Same NED convention as scenarios / DroneController (x=North, y=East, z=Down). Drones appear on the
 plot as they appear in the stream.
 
+Optional JSON fields (same packet as positions): ``targets`` — list of ``{"x","y","z"}`` waypoints
+drawn as black crosses; ``save_png`` — path string; the next redraw saves the figure to that file.
+
 Run:
   python visualizer/drone_position_visualizer.py
   python visualizer/drone_position_visualizer.py --port 15551
@@ -107,6 +110,8 @@ class PositionReceiver:
         self.port = port
         self.positions: Dict[Any, Dict[str, float]] = {}
         self.rates: Dict[str, Optional[float]] = {}
+        self.targets: List[Dict[str, float]] = []
+        self._pending_save_png: Optional[str] = None
         self.lock = threading.Lock()
         self.running = False
         self.sock: Optional[socket.socket] = None
@@ -138,7 +143,24 @@ class PositionReceiver:
                 obj = json.loads(data.decode("utf-8"))
                 pos_dict = obj.get("positions", {})
                 rates_dict = obj.get("rates")
+                targets_list = obj.get("targets")
+                save_png = obj.get("save_png")
                 with self.lock:
+                    if isinstance(targets_list, list):
+                        parsed_targets: List[Dict[str, float]] = []
+                        for p in targets_list:
+                            if not isinstance(p, dict):
+                                continue
+                            parsed_targets.append(
+                                {
+                                    "x": float(p.get("x", 0)),
+                                    "y": float(p.get("y", 0)),
+                                    "z": float(p.get("z", 0)),
+                                }
+                            )
+                        self.targets = parsed_targets
+                    if save_png is not None:
+                        self._pending_save_png = str(save_png)
                     for drone_id_str, p in pos_dict.items():
                         drone_id = int(drone_id_str) if drone_id_str.isdigit() else drone_id_str
                         x = float(p.get("x", 0))
@@ -173,6 +195,18 @@ class PositionReceiver:
         """
         with self.lock:
             return self.positions.copy(), {}
+
+    def get_targets(self) -> List[Dict[str, float]]:
+        """Return copy of last waypoint list (thread-safe)."""
+        with self.lock:
+            return [dict(t) for t in self.targets]
+
+    def pop_pending_save_png(self) -> Optional[str]:
+        """Return and clear one save path requested by the publisher (thread-safe)."""
+        with self.lock:
+            p = self._pending_save_png
+            self._pending_save_png = None
+            return p
 
     def get_rates(self) -> Dict[str, Optional[float]]:
         """Return copy of rates (thread-safe).
@@ -249,6 +283,7 @@ def run_visualizer(
 
     lines: Dict[Any, Any] = {}
     points: Dict[Any, Any] = {}
+    viz_art: Dict[str, Any] = {"targets_line": None}
 
     def _format_hz(v: Optional[float]) -> str:
         if v is None:
@@ -259,7 +294,10 @@ def run_visualizer(
             return "—"
 
     def init() -> List[Any]:
-        return list(lines.values()) + list(points.values())
+        r = list(lines.values()) + list(points.values())
+        if viz_art["targets_line"] is not None:
+            r.append(viz_art["targets_line"])
+        return r
 
     def animate(_: Any) -> List[Any]:
         pos, _ = receiver.get_positions()
@@ -279,8 +317,32 @@ def run_visualizer(
         )
         rates_text.set_text(rates_str)
 
+        tlist = receiver.get_targets()
+        if tlist:
+            xs = [t["x"] for t in tlist]
+            ys = [t["y"] for t in tlist]
+            if viz_art["targets_line"] is None:
+                (viz_art["targets_line"],) = ax.plot(
+                    xs,
+                    ys,
+                    linestyle="None",
+                    marker="+",
+                    color="#111827",
+                    markersize=14,
+                    markeredgewidth=2,
+                    label="Targets",
+                    zorder=6,
+                )
+            else:
+                viz_art["targets_line"].set_data(xs, ys)
+        elif viz_art["targets_line"] is not None:
+            viz_art["targets_line"].set_data([], [])
+
         # Current positions only (no history) — one point per drone
         all_x, all_y = [], []
+        for t in tlist:
+            all_x.append(t["x"])
+            all_y.append(t["y"])
         for drone_id, p in list(pos.items()):
             if drone_id not in lines:
                 col = color_for_drone(drone_id)
@@ -298,6 +360,9 @@ def run_visualizer(
         if lines:
             handles = [lines[did] for did in sorted(lines.keys())]
             labels = [label_for_drone(did) for did in sorted(lines.keys())]
+            if viz_art["targets_line"] is not None:
+                handles.append(viz_art["targets_line"])
+                labels.append("Targets")
             ax.legend(handles, labels, loc="upper left", fontsize=9)
         if not fixed_axes and all_x and all_y:
             margin = 2.0
@@ -312,9 +377,20 @@ def run_visualizer(
             ax.set_xlim(x_center - half, x_center + half)
             ax.set_ylim(y_center - half, y_center + half)
 
-        return list(lines.values()) + list(points.values())
+        ret = list(lines.values()) + list(points.values())
+        if viz_art["targets_line"] is not None:
+            ret.append(viz_art["targets_line"])
+        png_path = receiver.pop_pending_save_png()
+        if png_path:
+            try:
+                fig.canvas.draw()
+                fig.savefig(png_path, dpi=150, bbox_inches="tight")
+                logger.info("Saved live figure to %s", png_path)
+            except Exception as exc:
+                logger.warning("Could not save figure to %s: %s", png_path, exc)
+        return ret
 
-    anim = animation.FuncAnimation(
+    _ = animation.FuncAnimation(
         fig,
         animate,
         init_func=init,
