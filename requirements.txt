@@ -5,6 +5,7 @@ ruff>=0.15
 # Plotting experiment CSV (scripts/plot_experiment_csv.py)
 matplotlib>=3.7
 numpy>=1.24
+scipy>=1.9
 
 # Tests (pytest tests/)
 pytest>=7.0
