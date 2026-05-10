@@ -10,8 +10,11 @@ Usage:
   python launch_simulation.py -s -c leader_forward_back --with-2d-visualizer \\
       --viz-fixed-axes --viz-xlim -40 40 --viz-ylim -10 50   # fixed matplotlib window (NED m)
   python launch_simulation.py -s --batch-params   # sequential PID sweep from YAML (SITL-only)
-  python launch_simulation.py -s -c leader_forward_back  # default: MAVProxy GUIs + pkill cleanup
-  python launch_simulation.py -s -c leader_forward_back --without-mavproxy-consoles  # direct TCP from scenarios
+  python launch_simulation.py -s -c leader_forward_back  # pkill MAVProxy before + after run; MAVProxy GUIs default
+  python launch_simulation.py -s -c leader_forward_back --drones 3   # three SITL; no waf (default)
+
+By default ``sim_vehicle`` uses ``-N`` (launcher skips waf). Build once under ../ardupilot or use
+``--sitl-rebuild-waf`` / ``DRONE_SWARM_SITL_ALLOW_WAF_REBUILD=1`` after editing ArduPilot.
 
 Simulation modes:
   --webots, -w      Webots 3D + SITL
@@ -50,6 +53,38 @@ def _sitl_subprocess_popen_kwargs() -> dict:
     return {"start_new_session": True}
 
 
+def _sitl_subprocess_env() -> dict:
+    """Environment for ``sim_vehicle`` so nested waf builds see extra ``CXXFLAGS`` (e.g. SITL trace).
+
+    Prepend ``ARDUPILOT_SITL_CXXFLAGS`` to existing ``CXXFLAGS`` when set.
+
+    Sets ``DRONE_SWARM_SITL_TELEM_TRACE_DIR`` to ``<project>/logs/time_sync`` (absolute) unless
+    already set, for patched ArduPilot ``AP_SITL_RC_TELEM_TRACE`` CSV output.
+    """
+    env = os.environ.copy()
+
+    trace_dir = (env.get("DRONE_SWARM_SITL_TELEM_TRACE_DIR") or "").strip()
+    if not trace_dir:
+        trace_dir = os.path.join(project_root, "logs", "time_sync")
+    try:
+        os.makedirs(trace_dir, exist_ok=True)
+    except OSError as exc:
+        logger.warning("[SITL] Could not create trace dir %s: %s", trace_dir, exc)
+    env["DRONE_SWARM_SITL_TELEM_TRACE_DIR"] = os.path.abspath(trace_dir)
+
+    extra = (os.environ.get("ARDUPILOT_SITL_CXXFLAGS") or "").strip()
+    if not extra:
+        return env
+    prev = (env.get("CXXFLAGS") or "").strip()
+    merged = f"{extra} {prev}".strip() if prev else extra
+    env["CXXFLAGS"] = merged
+    logger.info(
+        "[SITL] Merged CXXFLAGS for sim_vehicle (first ~120 chars): %s",
+        merged[:120],
+    )
+    return env
+
+
 def _terminate_sitl_process_group(proc: subprocess.Popen) -> None:
     """SIGTERM the whole sim_vehicle process group (e.g. xterm/SITL, MAVProxy if present)."""
     try:
@@ -73,27 +108,35 @@ def _kill_sitl_process_group(proc: subprocess.Popen) -> None:
 
 
 def _pkill_mavproxy_processes() -> None:
-    """Run ``pkill -f mavproxy.py`` (POSIX). Kills all matching MAVProxy on the host."""
+    """Kill stray MAVProxy processes (POSIX): ``mavproxy.py`` and ``MAVProxy`` on the cmdline.
+
+    Called before starting SITL (each launch) and after shutdown when MAVProxy consoles were used.
+    """
     if sys.platform == "win32":
         return
-    try:
-        completed = subprocess.run(
-            ["pkill", "-f", "mavproxy.py"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if completed.returncode == 0:
-            logger.info("[Launcher] pkill -f mavproxy.py: terminated matching process(es).")
-        else:
-            logger.info(
-                "[Launcher] pkill -f mavproxy.py: exit %s (no match or already gone).",
-                completed.returncode,
+    for pattern in ("mavproxy.py", "MAVProxy"):
+        try:
+            completed = subprocess.run(
+                ["pkill", "-f", pattern],
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
-    except FileNotFoundError:
-        logger.warning("[Launcher] pkill not found; MAVProxy cleanup skipped.")
-    except subprocess.TimeoutExpired:
-        logger.warning("[Launcher] pkill -f mavproxy.py timed out.")
+            if completed.returncode == 0:
+                logger.info(
+                    "[Launcher] pkill -f %s: terminated matching process(es).", pattern
+                )
+            else:
+                logger.info(
+                    "[Launcher] pkill -f %s: exit %s (no match or already gone).",
+                    pattern,
+                    completed.returncode,
+                )
+        except FileNotFoundError:
+            logger.warning("[Launcher] pkill not found; MAVProxy cleanup skipped.")
+            return
+        except subprocess.TimeoutExpired:
+            logger.warning("[Launcher] pkill -f %s timed out.", pattern)
 
 
 APM_HOME: str = os.path.join(project_root, "..", "ardupilot")
@@ -159,6 +202,12 @@ SCENARIOS: List[Tuple[str, str, str, str]] = [
         "scenarios/snake_distance_ground_follower.py",
         project_root,
     ),
+    (
+        "task_assignment_decentralized",
+        "Decentralized task assignment (Hungarian) + PID to targets",
+        "scenarios/task_assignment_decentralized.py",
+        project_root,
+    ),
 ]
 
 # Russian labels for the interactive scenario menu (see образец_интерактивного_меню.txt).
@@ -167,6 +216,7 @@ INTERACTIVE_SCENARIO_LABELS_RU: Tuple[str, ...] = (
     "Преследование змейкой (+Y)",
     "Движение формации",
     "Лидер +Y, фолловер на земле, лог расстояния",
+    "Децентрализованное назначение целей (венгерский метод)",
 )
 
 
@@ -196,6 +246,53 @@ def _scenario_from_custom_input(raw: str) -> Optional[Tuple[str, str, str, str]]
     return None
 
 
+def prebuild_ardupilot_sitl_copter() -> None:
+    """Run ``waf configure --board sitl`` then ``waf copter`` once under ``../ardupilot``.
+
+    Invoked via ``sys.executable`` plus the bundled ``waf`` script so it behaves like
+    ``python waf``. Uses :func:`_sitl_subprocess_env` so optional ``CXXFLAGS`` matches
+    ``sim_vehicle``. Call only when explicitly requested (--sitl-rebuild-waf).
+    """
+    if not os.path.isdir(APM_HOME):
+        logger.error("[SITL] Prebuild skipped: ../ardupilot not found (%s)", APM_HOME)
+        raise FileNotFoundError(APM_HOME)
+    waf_py = os.path.join(APM_HOME, "waf")
+    if not os.path.isfile(waf_py):
+        logger.error("[SITL] Prebuild skipped: missing waf script in %s", APM_HOME)
+        raise FileNotFoundError(waf_py)
+
+    cwd = APM_HOME
+    env = _sitl_subprocess_env()
+    waf_cmd = [sys.executable, waf_py]
+
+    logger.info("[SITL] Running single waf configure+build copter under %s", cwd)
+    subprocess.run(
+        waf_cmd + ["configure", "--board", "sitl"],
+        cwd=cwd,
+        env=env,
+        check=True,
+    )
+    subprocess.run(waf_cmd + ["copter"], cwd=cwd, env=env, check=True)
+    logger.info("[SITL] Prebuild finished (configure + copter).")
+
+
+def _sitl_vehicle_bin_dir() -> str:
+    return os.path.join(APM_HOME, "build", "sitl", "bin")
+
+
+def sitl_vehicle_binary_maybe_present() -> bool:
+    """Heuristic: Copter binary exists under ``../ardupilot/build/sitl/bin``."""
+    bd = _sitl_vehicle_bin_dir()
+    if not os.path.isdir(bd):
+        return False
+    for name in os.listdir(bd):
+        if name.startswith("ardu") or name == "ardu":
+            fp = os.path.join(bd, name)
+            if os.path.isfile(fp):
+                return True
+    return False
+
+
 def _close_sitl_log_files(handles) -> None:
     """Close SITL stdout log handles opened in main(); safe if already closed."""
     for f in handles:
@@ -205,6 +302,40 @@ def _close_sitl_log_files(handles) -> None:
             pass
 
 
+def _shutdown_sim_vehicle_spawns(
+    handles: List[subprocess.Popen],
+    *,
+    pkill_mavproxy_after: bool,
+) -> None:
+    """SIGTERM/KILL ``sim_vehicle`` process groups (+ optional stray MAVProxy pkill)."""
+    if not handles:
+        return
+    for p in handles:
+        try:
+            _terminate_sitl_process_group(p)
+        except Exception:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+    time.sleep(0.5)
+    for p in handles:
+        try:
+            p.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            try:
+                _kill_sitl_process_group(p)
+            except Exception:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    if pkill_mavproxy_after:
+        _pkill_mavproxy_processes()
+
+
 def start_sitl_only(
     proj_root: str,
     num_drones: int = 2,
@@ -212,6 +343,7 @@ def start_sitl_only(
     log_files=None,
     extra_param_files: Optional[List[str]] = None,
     no_mavproxy: bool = False,
+    sitl_no_rebuild: bool = False,
 ) -> List[subprocess.Popen]:
     """Start SITL instances without Webots.
 
@@ -222,6 +354,8 @@ def start_sitl_only(
         log_files: Open text handles for stdout/stderr (one per drone); length must equal num_drones.
         extra_param_files: Additional ``.parm`` paths (relative to proj_root or absolute).
         no_mavproxy: If True, pass ``--no-mavproxy`` (scenarios must use TCP ``5760+10*i``).
+        sitl_no_rebuild: If True, pass ``-N`` every ``sim_vehicle.py`` (no nested waf).
+            Use when binaries already built (or after launcher multi-drone prebuild).
 
     Returns:
         List of started subprocess Popen objects, or empty list on error.
@@ -249,58 +383,77 @@ def start_sitl_only(
         p = os.path.join(proj_root, rel) if rel and not os.path.isabs(rel) else rel
         if p and os.path.isfile(p):
             extra_params.append(f"--add-param-file={os.path.abspath(p)}")
-    processes = []
+    processes_spawned: List[subprocess.Popen] = []
     BASE_UDP_PORT = 14551
     cwd = APM_HOME if os.path.isdir(APM_HOME) else proj_root
-    for i in range(num_drones):
-        udp_port = BASE_UDP_PORT + i * 10
-        tcp_sitl = 5760 + i * 10
-        home_str = _sitl_home_for_drone(i)
-        args = [
-            sys.executable,
-            SIM_VEHICLE_PATH,
-            "-v",
-            "ArduCopter",
-            "-w",
-            f"--instance={i}",
-            f"--sysid={i + 1}",
-            "-l",
-            home_str,
-        ]
-        if no_mavproxy:
-            args.append("--no-mavproxy")
-            logger.info(
-                "[SITL] instance=%s, no MAVProxy; scenario TCP 127.0.0.1:%s, custom_location=%s",
-                i,
-                tcp_sitl,
-                home_str,
-            )
-        else:
-            args.extend(
+    try:
+        for i in range(num_drones):
+            udp_port = BASE_UDP_PORT + i * 10
+            tcp_sitl = 5760 + i * 10
+            home_str = _sitl_home_for_drone(i)
+            args_list: List[str] = [
+                sys.executable,
+                SIM_VEHICLE_PATH,
+            ]
+            if sitl_no_rebuild:
+                args_list.append("-N")
+            args_list.extend(
                 [
-                    f"--out=127.0.0.1:{udp_port}",
-                    "--console",
+                    "-v",
+                    "ArduCopter",
+                    "-w",
+                    f"--instance={i}",
+                    f"--sysid={i + 1}",
+                    "-l",
+                    home_str,
                 ]
             )
-            logger.info(
-                "[SITL] instance=%s, UDP -> 127.0.0.1:%s, custom_location=%s",
-                i,
-                udp_port,
-                home_str,
+            args = args_list
+            if no_mavproxy:
+                args.append("--no-mavproxy")
+                logger.info(
+                    "[SITL] instance=%s, no MAVProxy; scenario TCP 127.0.0.1:%s, custom_location=%s",
+                    i,
+                    tcp_sitl,
+                    home_str,
+                )
+            else:
+                args.extend(
+                    [
+                        f"--out=127.0.0.1:{udp_port}",
+                        "--console",
+                    ]
+                )
+                logger.info(
+                    "[SITL] instance=%s, UDP -> 127.0.0.1:%s, custom_location=%s",
+                    i,
+                    udp_port,
+                    home_str,
+                )
+            if extra_params:
+                args.extend(extra_params)
+            log_f = log_files[i]
+            proc = subprocess.Popen(
+                args,
+                cwd=cwd,
+                stdout=log_f,
+                stderr=subprocess.STDOUT,
+                env=_sitl_subprocess_env(),
+                **_sitl_subprocess_popen_kwargs(),
             )
-        if extra_params:
-            args.extend(extra_params)
-        log_f = log_files[i]
-        proc = subprocess.Popen(
-            args,
-            cwd=cwd,
-            stdout=log_f,
-            stderr=subprocess.STDOUT,
-            **_sitl_subprocess_popen_kwargs(),
+            processes_spawned.append(proc)
+            time.sleep(5)
+    except KeyboardInterrupt:
+        logger.info(
+            "[SITL] KeyboardInterrupt during sim_vehicle startup; terminating %s instance(s)...",
+            len(processes_spawned),
         )
-        processes.append(proc)
-        time.sleep(5)
-    return processes
+        _shutdown_sim_vehicle_spawns(
+            processes_spawned,
+            pkill_mavproxy_after=(not no_mavproxy),
+        )
+        raise KeyboardInterrupt from None
+    return processes_spawned
 
 
 def start_sitl_webots(
@@ -309,15 +462,17 @@ def start_sitl_webots(
     param_file: Optional[str] = None,
     log_files=None,
     extra_param_files: Optional[List[str]] = None,
+    sitl_no_rebuild: bool = False,
 ) -> List[subprocess.Popen]:
     """Start SITL instances with Webots (webots-python model).
 
     Args:
-        proj_root: Project root directory path.
-        num_drones: Number of drone instances to start.
+        proj_root: Project root directory.
+        num_drones: Number of drone instances.
         param_file: Optional path to ArduPilot parameter file (relative to proj_root).
-        log_files: Open text handles for stdout/stderr (one per drone); length must equal num_drones.
-        extra_param_files: Additional ``.parm`` paths (relative to proj_root or absolute).
+        log_files: Open text handles per drone.
+        extra_param_files: Additional ``.parm`` paths.
+        sitl_no_rebuild: If True, pass ``-N`` to every ``sim_vehicle.py``.
 
     Returns:
         List of started SITL subprocess Popen objects, or empty list on error.
@@ -343,47 +498,63 @@ def start_sitl_webots(
         p = os.path.join(proj_root, rel) if rel and not os.path.isabs(rel) else rel
         if p and os.path.isfile(p):
             extra.append(f"--add-param-file={os.path.abspath(p)}")
-    processes = []
+    processes_spawned: List[subprocess.Popen] = []
     cwd = APM_HOME if os.path.isdir(APM_HOME) else proj_root
-    for i in range(num_drones):
-        tcp_port = BASE_TCP + i * 10
-        udp_port = BASE_UDP + i * 10
-        home_str = _sitl_home_for_drone(i)
-        args = [
-            sys.executable,
-            SIM_VEHICLE_PATH,
-            "-v",
-            "ArduCopter",
-            "-w",
-            "--model",
-            "webots-python",
-            f"--instance={i}",
-            f"--sysid={i + 1}",
-            f"--out=127.0.0.1:{tcp_port}",
-            f"--out=127.0.0.1:{udp_port}",
-            "-l",
-            home_str,
-        ]
-        if extra:
-            args.extend(extra)
+    try:
+        for i in range(num_drones):
+            tcp_port = BASE_TCP + i * 10
+            udp_port = BASE_UDP + i * 10
+            home_str = _sitl_home_for_drone(i)
+            args_list: List[str] = [
+                sys.executable,
+                SIM_VEHICLE_PATH,
+            ]
+            if sitl_no_rebuild:
+                args_list.append("-N")
+            args_list.extend(
+                [
+                    "-v",
+                    "ArduCopter",
+                    "-w",
+                    "--model",
+                    "webots-python",
+                    f"--instance={i}",
+                    f"--sysid={i + 1}",
+                    f"--out=127.0.0.1:{tcp_port}",
+                    f"--out=127.0.0.1:{udp_port}",
+                    "-l",
+                    home_str,
+                ]
+            )
+            args = args_list
+            if extra:
+                args.extend(extra)
+            logger.info(
+                "[SITL] instance=%s, TCP=%s, UDP=%s, custom_location=%s",
+                i,
+                tcp_port,
+                udp_port,
+                home_str,
+            )
+            log_f = log_files[i]
+            proc = subprocess.Popen(
+                args,
+                cwd=cwd,
+                stdout=log_f,
+                stderr=subprocess.STDOUT,
+                env=_sitl_subprocess_env(),
+                **_sitl_subprocess_popen_kwargs(),
+            )
+            processes_spawned.append(proc)
+            time.sleep(5)
+    except KeyboardInterrupt:
         logger.info(
-            "[SITL] instance=%s, TCP=%s, UDP=%s, custom_location=%s",
-            i,
-            tcp_port,
-            udp_port,
-            home_str,
+            "[SITL/Webots] KeyboardInterrupt during sim_vehicle startup; terminating %s instance(s)...",
+            len(processes_spawned),
         )
-        log_f = log_files[i]
-        proc = subprocess.Popen(
-            args,
-            cwd=cwd,
-            stdout=log_f,
-            stderr=subprocess.STDOUT,
-            **_sitl_subprocess_popen_kwargs(),
-        )
-        processes.append(proc)
-        time.sleep(5)
-    return processes
+        _shutdown_sim_vehicle_spawns(processes_spawned, pkill_mavproxy_after=True)
+        raise KeyboardInterrupt from None
+    return processes_spawned
 
 
 def launch_webots(proj_root: str, num_drones: int = 2) -> Optional[subprocess.Popen]:
@@ -527,7 +698,7 @@ def _run_batch_from_yaml(args: argparse.Namespace) -> int:
         exp_abs = os.path.join(project_root, exp_rel)
         os.makedirs(exp_abs, exist_ok=True)
 
-        scenario_combo, sitl_combo = partition_combo_for_batch(combo)
+        scenario_combo, sitl_combo, launch_combo = partition_combo_for_batch(combo)
         overlay_rel: Optional[str] = None
         if sitl_combo:
             overlay_abs = os.path.join(
@@ -566,6 +737,14 @@ def _run_batch_from_yaml(args: argparse.Namespace) -> int:
             logger.error("[Batch] %s", exc)
             return 1
 
+        if launch_combo.get("num_drones") is not None:
+            run_num_drones = int(round(float(launch_combo["num_drones"])))
+        else:
+            run_num_drones = num_drones
+        if run_num_drones < 1:
+            logger.error("[Batch] swarm.num_drones override must be >= 1 (run %s)", run_idx)
+            return 1
+
         cmd: List[str] = [
             sys.executable,
             launcher,
@@ -573,7 +752,7 @@ def _run_batch_from_yaml(args: argparse.Namespace) -> int:
             "-c",
             scenario_id,
             "-n",
-            str(num_drones),
+            str(run_num_drones),
             "--param-file",
             args.param_file,
             "--exchange-hz",
@@ -587,7 +766,11 @@ def _run_batch_from_yaml(args: argparse.Namespace) -> int:
         cmd.extend(sweep_argv)
         # OFAT: fixed PID/SITL args from parent CLI apply to every batch child unless that
         # logical key is part of the current sweep (sweep_argv already set it).
-        if scenario_id in ("leader_forward_back", "snake_pursuit"):
+        if scenario_id in (
+            "leader_forward_back",
+            "snake_pursuit",
+            "task_assignment_decentralized",
+        ):
             if args.kp is not None and "pid.p_gain" not in scenario_combo:
                 cmd.extend(["--kp", str(args.kp)])
             if args.ki is not None and "pid.i_gain" not in scenario_combo:
@@ -596,6 +779,30 @@ def _run_batch_from_yaml(args: argparse.Namespace) -> int:
                 cmd.extend(["--kd", str(args.kd)])
             if args.derivative_alpha is not None and "pid.derivative_alpha" not in scenario_combo:
                 cmd.extend(["--derivative-alpha", str(args.derivative_alpha)])
+        if scenario_id == "task_assignment_decentralized":
+            if (
+                getattr(args, "num_targets", None) is not None
+                and "task.num_targets" not in scenario_combo
+            ):
+                cmd.extend(["--num-targets", str(args.num_targets)])
+            nt = getattr(args, "target_radius_m", None)
+            if nt is not None and "task.target_radius_m" not in scenario_combo:
+                cmd.extend(["--target-radius-m", str(nt)])
+            if getattr(args, "target_center_x", None) is not None and "task.target_center_x" not in scenario_combo:
+                cmd.extend(["--target-center-x", str(args.target_center_x)])
+            if getattr(args, "target_center_y", None) is not None and "task.target_center_y" not in scenario_combo:
+                cmd.extend(["--target-center-y", str(args.target_center_y)])
+            if args.no_exit_on_converged:
+                cmd.append("--no-exit-on-converged")
+            cmd.extend(["--post-assign-fly-sec", str(args.post_assign_fly_sec)])
+            cmd.extend(
+                ["--target-reach-radius-m", str(getattr(args, "target_reach_radius_m", 0.5))]
+            )
+            cmd.extend(
+                ["--target-reach-epsilon-m", str(getattr(args, "target_reach_epsilon_m", 0.0))]
+            )
+            if getattr(args, "allow_converged_without_reaching_targets", False):
+                cmd.append("--allow-converged-without-reaching-targets")
         if args.with_2d_visualizer:
             cmd.append("--with-2d-visualizer")
             if args.viz_fixed_axes:
@@ -675,7 +882,7 @@ def run_interactive_menu() -> Tuple[bool, Tuple[str, str, str, str], int, bool]:
         while True:
             custom = input(
                 "    Введите id сценария (leader_forward_back, snake_pursuit, square_pid, "
-                "snake_distance_ground_follower) "
+                "snake_distance_ground_follower, task_assignment_decentralized) "
                 "или относительный путь к .py: "
             ).strip()
             found = _scenario_from_custom_input(custom)
@@ -819,21 +1026,21 @@ Examples:
         type=float,
         default=None,
         metavar="K",
-        help="leader_forward_back / snake_pursuit: follower P gain; forwarded to scenario (--kp).",
+        help="leader_forward_back / snake_pursuit / task_assignment_decentralized: P gain; forwarded.",
     )
     parser.add_argument(
         "--ki",
         type=float,
         default=None,
         metavar="K",
-        help="leader_forward_back / snake_pursuit: follower I gain (roll and pitch).",
+        help="leader_forward_back / snake_pursuit / task_assignment_decentralized: I gain.",
     )
     parser.add_argument(
         "--kd",
         type=float,
         default=None,
         metavar="K",
-        help="leader_forward_back / snake_pursuit: follower D gain; forwarded to scenario (--kd).",
+        help="leader_forward_back / snake_pursuit / task_assignment_decentralized: D gain.",
     )
     parser.add_argument(
         "--derivative-alpha",
@@ -841,9 +1048,83 @@ Examples:
         default=None,
         metavar="A",
         help=(
-            "leader_forward_back / snake_pursuit: low-pass on derivative term for follower PIDs "
+            "leader_forward_back / snake_pursuit / task_assignment_decentralized: low-pass on D term "
             "(0..1, 0=no filter); passed as --derivative-alpha to scenario."
         ),
+    )
+    parser.add_argument(
+        "--post-assign-fly-sec",
+        type=float,
+        default=5.0,
+        metavar="SEC",
+        help=(
+            "task_assignment_decentralized only: fly at most SEC seconds after a converged assignment "
+            "before stopping coordination; passed as --post-assign-fly-sec."
+        ),
+    )
+    parser.add_argument(
+        "--no-exit-on-converged",
+        action="store_true",
+        help=(
+            "task_assignment_decentralized only: ignore early exit after converge and run until "
+            "--duration; forwarded as --no-exit-on-converged."
+        ),
+    )
+    parser.add_argument(
+        "--target-reach-radius-m",
+        type=float,
+        default=0.5,
+        metavar="R",
+        help=(
+            "task_assignment_decentralized: horizontal NED XY distance (m) to count as «at target»; "
+            "forwarded as --target-reach-radius-m."
+        ),
+    )
+    parser.add_argument(
+        "--target-reach-epsilon-m",
+        type=float,
+        default=0.0,
+        metavar="E",
+        help=(
+            "task_assignment_decentralized: optional margin (m) added to R for final at-target check; "
+            "forwarded as --target-reach-epsilon-m."
+        ),
+    )
+    parser.add_argument(
+        "--allow-converged-without-reaching-targets",
+        action="store_true",
+        help=(
+            "task_assignment_decentralized: solver-only converged + short post-assign window; "
+            "forwarded as --allow-converged-without-reaching-targets."
+        ),
+    )
+    parser.add_argument(
+        "--num-targets",
+        type=int,
+        default=None,
+        metavar="K",
+        help=(
+            "task_assignment_decentralized only: fixed number of target waypoints; "
+            "omit for K = number of drones (square)."
+        ),
+    )
+    parser.add_argument(
+        "--target-center-x",
+        type=float,
+        default=0.0,
+        help="task_assignment_decentralized: target circle center X (m, NED North).",
+    )
+    parser.add_argument(
+        "--target-center-y",
+        type=float,
+        default=0.0,
+        help="task_assignment_decentralized: target circle center Y (m, NED East).",
+    )
+    parser.add_argument(
+        "--target-radius-m",
+        type=float,
+        default=12.0,
+        help="task_assignment_decentralized: target circle radius (m).",
     )
     parser.add_argument(
         "--leader-roll-pwm",
@@ -876,8 +1157,26 @@ Examples:
         help=(
             "SITL-only: disable default MAVProxy --console mode and run direct TCP "
             "(scenarios connect to 127.0.0.1:5760+10*i). "
-            "By default MAVProxy consoles are enabled and the launcher runs "
-            "pkill -f mavproxy.py on shutdown."
+            "The launcher always runs pkill for MAVProxy (mavproxy.py / MAVProxy on cmdline) "
+            "before starting SITL; with default consoles it also runs pkill on shutdown."
+        ),
+    )
+    parser.add_argument(
+        "--sitl-rebuild-waf",
+        action="store_true",
+        help=(
+            "Run ../ardupilot waf configure (--board sitl) and waf copter once before spawning "
+            "SITL, then pass -N to every sim_vehicle. Default is NO waf. "
+            "Env: DRONE_SWARM_SITL_ALLOW_WAF_REBUILD=1."
+        ),
+    )
+    parser.add_argument(
+        "--sitl-no-rebuild",
+        action="store_true",
+        help=(
+            "(Default behaviour already.) Pass -N — kept for backwards compatibility "
+            "(scripts). Env DRONE_SWARM_SITL_NO_REBUILD=1 is redundant unless you need "
+            "to stay explicit."
         ),
     )
     args = parser.parse_args()
@@ -926,6 +1225,37 @@ Examples:
     sitl_direct_tcp = (not use_webots) and args.without_mavproxy_consoles
     use_mavproxy_consoles = (not use_webots) and (not sitl_direct_tcp)
 
+    sitl_rebuild_requested = bool(
+        args.sitl_rebuild_waf
+        or os.environ.get("DRONE_SWARM_SITL_ALLOW_WAF_REBUILD", "").strip() == "1"
+    )
+    if sitl_rebuild_requested:
+        try:
+            prebuild_ardupilot_sitl_copter()
+        except FileNotFoundError as exc:
+            logger.error("[SITL] Prebuild path error: %s", exc)
+            sys.exit(1)
+        except subprocess.CalledProcessError as exc:
+            logger.error("[SITL] Prebuild failed (waf exited %s).", exc.returncode)
+            sys.exit(1)
+        logger.info("[SITL] sim_vehicle launches use -N after prebuild.")
+    else:
+        logger.info("[SITL] sim_vehicle launches use -N (no waf this run).")
+
+    sitl_no_rebuild_effective = True
+    if (
+        os.path.isdir(APM_HOME)
+        and os.path.isfile(SIM_VEHICLE_PATH)
+        and not sitl_vehicle_binary_maybe_present()
+    ):
+        logger.warning(
+            "[SITL] No vehicle binary found under ../ardupilot/build/sitl/bin — "
+            "build once there (python waf configure --board sitl && python waf copter), "
+            "or rerun with --sitl-rebuild-waf."
+        )
+
+    _pkill_mavproxy_processes()
+
     sitl_log_dir = os.path.join(project_root, "logs", "sitl")
     os.makedirs(sitl_log_dir, exist_ok=True)
     sitl_log_basename = "sitl_webots_instance" if use_webots else "sitl_instance"
@@ -940,23 +1270,55 @@ Examples:
         if webots_proc:
             processes.append(webots_proc)
             time.sleep(5)
-        sitl_procs = start_sitl_webots(
-            project_root,
-            num_drones,
-            args.param_file,
-            log_files=sitl_log_files,
-            extra_param_files=args.sitl_param_overlay or [],
-        )
+        try:
+            sitl_procs = start_sitl_webots(
+                project_root,
+                num_drones,
+                args.param_file,
+                log_files=sitl_log_files,
+                extra_param_files=args.sitl_param_overlay or [],
+                sitl_no_rebuild=sitl_no_rebuild_effective,
+            )
+        except KeyboardInterrupt:
+            for p in processes:
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+            try:
+                time.sleep(0.5)
+            except KeyboardInterrupt:
+                pass
+            for p in processes:
+                try:
+                    p.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            _close_sitl_log_files(sitl_log_files)
+            _pkill_mavproxy_processes()
+            sys.exit(130)
         processes.extend(sitl_procs)
     else:
-        sitl_procs = start_sitl_only(
-            project_root,
-            num_drones,
-            args.param_file,
-            log_files=sitl_log_files,
-            extra_param_files=args.sitl_param_overlay or [],
-            no_mavproxy=sitl_direct_tcp,
-        )
+        try:
+            sitl_procs = start_sitl_only(
+                project_root,
+                num_drones,
+                args.param_file,
+                log_files=sitl_log_files,
+                extra_param_files=args.sitl_param_overlay or [],
+                no_mavproxy=sitl_direct_tcp,
+                sitl_no_rebuild=sitl_no_rebuild_effective,
+            )
+        except KeyboardInterrupt:
+            _close_sitl_log_files(sitl_log_files)
+            if use_mavproxy_consoles:
+                _pkill_mavproxy_processes()
+            sys.exit(130)
         processes.extend(sitl_procs)
 
     if not sitl_procs:
@@ -997,7 +1359,36 @@ Examples:
         "(longer for direct TCP / --no-mavproxy on slow hosts).",
         sitl_boot_wait_sec,
     )
-    time.sleep(sitl_boot_wait_sec)
+    try:
+        time.sleep(sitl_boot_wait_sec)
+    except KeyboardInterrupt:
+        _sitl_frozen = frozenset(sitl_procs)
+        _shutdown_sim_vehicle_spawns(list(sitl_procs), pkill_mavproxy_after=False)
+        for p in processes:
+            if p not in _sitl_frozen:
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+        try:
+            time.sleep(0.5)
+        except KeyboardInterrupt:
+            pass
+        for p in processes:
+            if p not in _sitl_frozen:
+                try:
+                    p.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+        _close_sitl_log_files(sitl_log_files)
+        if use_mavproxy_consoles:
+            _pkill_mavproxy_processes()
+        sys.exit(130)
 
     if use_2d_visualizer:
         visualizer_script = os.path.join(
@@ -1033,6 +1424,8 @@ Examples:
     scenario_env = os.environ.copy()
     if sitl_direct_tcp:
         scenario_env["DRONE_SWARM_SITL_DIRECT_TCP"] = "1"
+    if use_2d_visualizer:
+        scenario_env["DRONE_SWARM_WITH_2D_VIZ"] = "1"
     if args.duration > 0:
         scenario_cmd.extend(["--duration", str(args.duration)])
     if args.experiment_dir:
@@ -1040,7 +1433,11 @@ Examples:
     exchange_hz = args.exchange_hz
     if exchange_hz > 0:
         scenario_cmd.extend(["--exchange-hz", str(exchange_hz)])
-    if scenario[0] in ("leader_forward_back", "snake_pursuit"):
+    if scenario[0] in (
+        "leader_forward_back",
+        "snake_pursuit",
+        "task_assignment_decentralized",
+    ):
         if args.kp is not None:
             scenario_cmd.extend(["--kp", str(args.kp)])
         if args.ki is not None:
@@ -1049,14 +1446,57 @@ Examples:
             scenario_cmd.extend(["--kd", str(args.kd)])
     elif any(getattr(args, x, None) is not None for x in ("kp", "ki", "kd")):
         logger.warning(
-            "[Launcher] --kp/--ki/--kd apply only to leader_forward_back and snake_pursuit; ignoring."
+            "[Launcher] --kp/--ki/--kd apply only to leader_forward_back, snake_pursuit, "
+            "and task_assignment_decentralized; ignoring."
         )
     if args.derivative_alpha is not None:
-        if scenario[0] in ("leader_forward_back", "snake_pursuit"):
+        if scenario[0] in (
+            "leader_forward_back",
+            "snake_pursuit",
+            "task_assignment_decentralized",
+        ):
             scenario_cmd.extend(["--derivative-alpha", str(args.derivative_alpha)])
         else:
             logger.warning(
-                "[Launcher] --derivative-alpha applies only to leader_forward_back and snake_pursuit; ignoring."
+                "[Launcher] --derivative-alpha applies only to leader_forward_back, snake_pursuit, "
+                "and task_assignment_decentralized; ignoring."
+            )
+    if scenario[0] == "task_assignment_decentralized":
+        scenario_cmd.extend(["--post-assign-fly-sec", str(args.post_assign_fly_sec)])
+        scenario_cmd.extend(["--target-reach-radius-m", str(args.target_reach_radius_m)])
+        scenario_cmd.extend(["--target-reach-epsilon-m", str(args.target_reach_epsilon_m)])
+        if args.allow_converged_without_reaching_targets:
+            scenario_cmd.append("--allow-converged-without-reaching-targets")
+        if args.no_exit_on_converged:
+            scenario_cmd.append("--no-exit-on-converged")
+        scenario_cmd.extend(
+            [
+                "--target-radius-m",
+                str(args.target_radius_m),
+                "--target-center-x",
+                str(args.target_center_x),
+                "--target-center-y",
+                str(args.target_center_y),
+            ]
+        )
+        if args.num_targets is not None:
+            scenario_cmd.extend(["--num-targets", str(args.num_targets)])
+    else:
+        if args.no_exit_on_converged:
+            logger.warning(
+                "[Launcher] --no-exit-on-converged applies only to "
+                "task_assignment_decentralized; ignoring."
+            )
+        if (
+            args.num_targets is not None
+            or args.target_center_x != 0.0
+            or args.target_center_y != 0.0
+            or args.target_radius_m != 12.0
+        ):
+            logger.warning(
+                "[Launcher] target geometry flags apply only to task_assignment_decentralized; "
+                "ignoring for scenario %s.",
+                scenario[0],
             )
     if args.leader_roll_pwm is not None:
         if scenario[0] in ("snake_pursuit", "snake_distance_ground_follower"):
