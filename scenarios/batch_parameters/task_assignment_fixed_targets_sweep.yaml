@@ -1,0 +1,40 @@
+# Демонстрация серии экспериментов без отдельных скриптов: встроенный batch в launch_simulation.py
+# (см. core/batch/, --batch-params).
+#
+# Фиксированная геометрия целей: K=5, окружность R=5 м, центр (10, -5) в общем NED.
+# Перебор: число дронов N = 2 … 8 (ось swarm.num_drones → дочерний лончер получает -n).
+#
+# Запуск из корня репозитория (venv активирован):
+#   python launch_simulation.py -s --batch-params scenarios/batch_parameters/task_assignment_fixed_targets_sweep.yaml
+#
+# Сценарий и длительность можно задать здесь или переопределить: -c ... --duration ...
+#
+# Логические имена осей → CLI см. core/batch/param_cli.py:
+#   swarm.num_drones, task.num_targets, task.target_radius_m, task.target_reach_radius_m,
+#   task.target_center_x/y,
+#   pid.p_gain, sitl.ANGLE_MAX, …
+
+batch:
+  scenario: task_assignment_decentralized
+  drones: 2
+  duration_sec: 180.0
+
+launch:
+  batch_id: task_demo_fixed5_targets
+  duration_sec: 180.0
+
+# Декартово произведение. Оси с одним значением (start=stop) задают константы в каждой комбинации.
+parameter_sweeps:
+  - target_parameter: "swarm.num_drones"
+    range: { start: 2.0, stop: 8.0, step: 1.0 }
+  - target_parameter: "task.num_targets"
+    range: { start: 5.0, stop: 5.0, step: 1.0 }
+  - target_parameter: "task.target_radius_m"
+    range: { start: 5.0, stop: 5.0, step: 1.0 }
+  - target_parameter: "task.target_center_x"
+    range: { start: 10.0, stop: 10.0, step: 1.0 }
+  - target_parameter: "task.target_center_y"
+    range: { start: -5.0, stop: -5.0, step: 1.0 }
+
+experiment_settings:
+  iterations: 1

@@ -1,6 +1,9 @@
 # Конфигурация серии экспериментов (YAML). Парсер: core.batch (user_batch_params + param_cli).
 # Запуск: python launch_simulation.py -s --batch-params
 #         или python launch_simulation.py -s --batch-params scenarios/batch_parameters/user_batch_params.yaml
+#
+# Другой пример: task_assignment_decentralized с осями swarm.num_drones / task.*
+#   scenarios/batch_parameters/task_assignment_fixed_targets_sweep.yaml
 
 # Необязательный блок batch: те же поля, что у launch:; launch перекрывает batch.
 batch:
