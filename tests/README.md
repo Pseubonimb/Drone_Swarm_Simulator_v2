@@ -65,6 +65,8 @@ python -m pytest tests/ -q
 | `test_batch_params_derivative_alpha_argv` | Аргумент `--derivative-alpha`. |
 | `test_batch_params_unknown_key` | Неизвестный ключ → `ValueError`. |
 | `test_batch_params_unsupported_scenario` | Сценарий без PID-маппинга → `ValueError`. |
+| `test_batch_params_task_assignment_reach_radius_argv` | `task.target_reach_radius_m` → `--target-reach-radius-m`. |
+| `test_batch_params_to_scenario_argv_task_assignment` | Геометрия целей/`num-targets` для `task_assignment_decentralized`. |
 | `test_merge_batch_launch_from_yaml_only` | Слияние `launch` из YAML с namespace CLI. |
 | `test_merge_batch_launch_cli_overrides_scenario` | CLI переопределяет `scenario`, YAML — остальное. |
 | `test_batch_experiment_label_prefers_batch_id` | Метка эксперимента из `batch_id`. |

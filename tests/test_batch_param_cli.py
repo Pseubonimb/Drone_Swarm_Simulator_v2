@@ -37,6 +37,36 @@ def test_batch_params_derivative_alpha_argv() -> None:
     assert argv == ["--derivative-alpha", "0.25"]
 
 
+def test_batch_params_task_assignment_reach_radius_argv() -> None:
+    argv = batch_params_to_scenario_argv(
+        "task_assignment_decentralized",
+        {"task.target_reach_radius_m": 0.5},
+    )
+    assert argv == ["--target-reach-radius-m", "0.5"]
+
+
+def test_batch_params_to_scenario_argv_task_assignment() -> None:
+    argv = batch_params_to_scenario_argv(
+        "task_assignment_decentralized",
+        {
+            "task.num_targets": 5.0,
+            "task.target_radius_m": 5.0,
+            "task.target_center_x": 10.0,
+            "task.target_center_y": -5.0,
+        },
+    )
+    assert argv == [
+        "--num-targets",
+        "5",
+        "--target-radius-m",
+        "5.0",
+        "--target-center-x",
+        "10.0",
+        "--target-center-y",
+        "-5.0",
+    ]
+
+
 def test_batch_params_to_scenario_argv_snake_pursuit() -> None:
     argv = batch_params_to_scenario_argv(
         "snake_pursuit",
@@ -51,7 +81,7 @@ def test_batch_params_unknown_key() -> None:
 
 
 def test_batch_params_unsupported_scenario() -> None:
-    with pytest.raises(ValueError, match="no PID batch mapping"):
+    with pytest.raises(ValueError, match="no batch parameter mapping"):
         batch_params_to_scenario_argv("square_pid", {"pid.p_gain": 1.0})
 
 
@@ -105,6 +135,20 @@ launch:
     assert eff["scenario"] == "leader_forward_back"
     assert eff["drones"] == 5
     assert eff["duration_sec"] == 30
+
+
+def test_task_assignment_yaml_sweep_combo_count() -> None:
+    from core.batch.user_batch_params import (
+        generate_parameter_combinations,
+        load_user_batch_yaml,
+    )
+
+    path = _ROOT / "scenarios/batch_parameters/task_assignment_fixed_targets_sweep.yaml"
+    doc = load_user_batch_yaml(path)
+    combos = generate_parameter_combinations(doc)
+    assert len(combos) == 7
+    assert combos[0]["swarm.num_drones"] == 2.0
+    assert combos[-1]["swarm.num_drones"] == 8.0
 
 
 def test_merge_batch_launch_uses_batch_block() -> None:

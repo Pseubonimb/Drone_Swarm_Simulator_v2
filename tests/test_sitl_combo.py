@@ -15,11 +15,21 @@ from core.batch.sitl_combo import partition_combo_for_batch, write_sitl_overlay_
 
 
 def test_partition_combo() -> None:
-    sc, si = partition_combo_for_batch(
+    sc, si, launch = partition_combo_for_batch(
         {"pid.p_gain": 1.0, "sitl.ANGLE_MAX": 4500.0},
     )
     assert sc == {"pid.p_gain": 1.0}
     assert si == {"sitl.ANGLE_MAX": 4500.0}
+    assert launch == {}
+
+
+def test_partition_combo_swarm_num_drones() -> None:
+    sc, si, launch = partition_combo_for_batch(
+        {"swarm.num_drones": 4.0, "task.num_targets": 5.0},
+    )
+    assert sc == {"task.num_targets": 5.0}
+    assert si == {}
+    assert launch == {"num_drones": 4.0}
 
 
 def test_write_sitl_overlay_angle_max(tmp_path: Path) -> None:
