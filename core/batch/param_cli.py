@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, MutableMapping, Tuple
 
 # Logical keys from batch YAML -> scenario script argv (--kp, --ki, ...).
+# ``task_assignment_decentralized`` also maps task.* → geometry / num-targets (see tests).
 SCENARIO_PID_CLI_FLAGS: Dict[str, Dict[str, str]] = {
     "leader_forward_back": {
         "pid.p_gain": "--kp",
@@ -19,7 +20,21 @@ SCENARIO_PID_CLI_FLAGS: Dict[str, Dict[str, str]] = {
         "pid.d_gain": "--kd",
         "pid.derivative_alpha": "--derivative-alpha",
     },
+    "task_assignment_decentralized": {
+        "pid.p_gain": "--kp",
+        "pid.i_gain": "--ki",
+        "pid.d_gain": "--kd",
+        "pid.derivative_alpha": "--derivative-alpha",
+        "task.num_targets": "--num-targets",
+        "task.target_radius_m": "--target-radius-m",
+        "task.target_center_x": "--target-center-x",
+        "task.target_center_y": "--target-center-y",
+        "task.target_reach_radius_m": "--target-reach-radius-m",
+    },
 }
+
+# Batch keys passed as integer argv tokens (YAML still uses float ranges).
+_INTEGER_CLI_VALUES: frozenset[str] = frozenset({"task.num_targets"})
 
 
 def effective_launch_block(doc: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -54,7 +69,7 @@ def batch_params_to_scenario_argv(
     table = SCENARIO_PID_CLI_FLAGS.get(scenario_id)
     if table is None:
         raise ValueError(
-            f"Scenario {scenario_id!r} has no PID batch mapping; supported scenarios: "
+            f"Scenario {scenario_id!r} has no batch parameter mapping; supported scenarios: "
             f"{sorted(SCENARIO_PID_CLI_FLAGS)}"
         )
     out: List[str] = []
@@ -65,7 +80,10 @@ def batch_params_to_scenario_argv(
                 f"Unknown target_parameter {key!r} for scenario {scenario_id!r}. "
                 f"Known keys: {sorted(table)}"
             )
-        out.extend([flag, str(float(value))])
+        if key in _INTEGER_CLI_VALUES:
+            out.extend([flag, str(int(round(float(value))))])
+        else:
+            out.extend([flag, str(float(value))])
     return out
 
 

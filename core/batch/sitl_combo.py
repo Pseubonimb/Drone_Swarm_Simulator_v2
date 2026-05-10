@@ -8,16 +8,23 @@ from typing import Dict, Mapping, Tuple
 
 def partition_combo_for_batch(
     combo: Mapping[str, float],
-) -> Tuple[Dict[str, float], Dict[str, float]]:
-    """Split combination dict into scenario keys vs ``sitl.*`` keys (values unchanged)."""
+) -> Tuple[Dict[str, float], Dict[str, float], Dict[str, float]]:
+    """Split combination dict into scenario keys, ``sitl.*``, and launch overrides.
+
+    ``swarm.num_drones`` (YAML sweep value) does not go to the scenario script; the batch
+    runner maps it to launcher ``-n`` for that child process.
+    """
     scenario: Dict[str, float] = {}
     sitl: Dict[str, float] = {}
+    launch: Dict[str, float] = {}
     for k, v in combo.items():
         if isinstance(k, str) and k.startswith("sitl."):
             sitl[k] = float(v)
+        elif isinstance(k, str) and k == "swarm.num_drones":
+            launch["num_drones"] = float(v)
         else:
             scenario[k] = float(v)
-    return scenario, sitl
+    return scenario, sitl, launch
 
 
 def write_sitl_overlay_parm(path: str, sitl_params: Mapping[str, float]) -> None:
