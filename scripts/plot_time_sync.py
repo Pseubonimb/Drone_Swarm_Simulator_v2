@@ -1,36 +1,86 @@
 #!/usr/bin/env python3
 """
-Build one delay plot from per-step time-sync CSV.
+Delay plots: hypervisor (Python) + SITL (patched ArduPilot trace).
 
-X axis: CSV record index (step_idx).
-Y axis: delay (seconds).
+**Default (host wall-clock):** one axis ``t - t₀`` where ``t`` is host wall time
+(``py_write_wall_sec`` in ``drone_*_time_sync_steps.csv`` and ``host_wall_us`` on
+the TX line in ``sitl_rc_telem_*.csv``). ``t₀`` is the earliest sampled wall time
+among plotted points so both curves share comparable time.
 
-Example:
-    python3 scripts/plot_time_sync.py experiments/<run>/drone_1_time_sync_steps.csv
-    python3 scripts/plot_time_sync.py experiments/<run>/drone_1_time_sync_steps.csv --out plots/time_sync_d1.png
+**Mixed axis:** If the trace has ``mono_us`` but no usable ``host_wall_us`` on TX
+rows, the SITL series is plotted vs ``mono_us − trace_min`` (seconds); Python
+still uses ``py_write_wall_sec − t₀``. The subtitle/x-label notes that those
+horizontal scales are not the same clock.
+
+**SITL ``--sitl-tx``:** ArduPilot may log ``TX_ATTITUDE`` / ``TX_LOCAL_POS`` but not
+``TX_SIM_STATE``. Default ``AUTO`` tries ``TX_SIM_STATE``, then ``TX_ATTITUDE``, then
+``TX_LOCAL_POS`` (first with RC_RX pairs wins).
+
+Examples::
+    python3 scripts/plot_time_sync.py experiments/<run>/drone_1_time_sync_steps.csv \\
+        --sitl-latest --sitl-instance 0
+    python3 scripts/plot_time_sync.py experiments/<run>/drone_1_time_sync_steps.csv \\
+        --legacy-split
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import glob
 import os
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import matplotlib
-import matplotlib.colors as mcolors
 import numpy as np
-from matplotlib.patches import Patch
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_PROJECT_ROOT = _SCRIPT_DIR.parent
+
+# RC_RX pairs with first matching TX row after each RC_RX (see _deltas_rc_to_tx).
+_SITL_TX_AUTO_ORDER = ("TX_SIM_STATE", "TX_ATTITUDE", "TX_LOCAL_POS")
 
 
-def _load_step_sync_rows(csv_path: Path) -> Tuple[Dict[str, np.ndarray], Optional[List[str]]]:
-    """Load per-step time-sync rows aligned with drone_*.csv writes."""
+def time_sync_log_dir() -> Path:
+    return _PROJECT_ROOT / "logs" / "time_sync"
+
+
+def _trace_search_dirs() -> List[Path]:
+    dirs: List[Path] = []
+    v = (os.environ.get("DRONE_SWARM_SITL_TELEM_TRACE_DIR") or "").strip()
+    if v:
+        dirs.append(Path(v).resolve())
+    dirs.append(time_sync_log_dir())
+    dirs.append(Path("/tmp"))
+    seen: set[Path] = set()
+    out: List[Path] = []
+    for d in dirs:
+        if d not in seen:
+            seen.add(d)
+            out.append(d)
+    return out
+
+
+def glob_latest_sitl_trace(instance: int) -> Optional[Path]:
+    matches: List[Path] = []
+    for d in _trace_search_dirs():
+        pattern = str(d / f"sitl_rc_telem_{instance}_*.csv")
+        for p in glob.glob(pattern):
+            matches.append(Path(p))
+    if not matches:
+        return None
+    return max(matches, key=lambda p: p.stat().st_mtime)
+
+
+def _load_step_rows(
+    csv_path: Path,
+) -> Tuple[Dict[str, np.ndarray], Optional[List[str]]]:
     cols: Dict[str, List[float]] = {
         "step_idx": [],
+        "py_write_wall_sec": [],
         "hypervisor_rx_to_tx_sec": [],
-        "sitl_cmd_to_response_sitl_sec": [],
-        "sitl_cmd_to_response_py_sec": [],
     }
     modes: List[str] = []
     has_flight_mode = False
@@ -43,7 +93,6 @@ def _load_step_sync_rows(csv_path: Path) -> Tuple[Dict[str, np.ndarray], Optiona
                 step_idx = float((row.get("step_idx") or "").strip())
             except ValueError:
                 continue
-
             cols["step_idx"].append(step_idx)
 
             def parse_optional(name: str) -> float:
@@ -53,12 +102,9 @@ def _load_step_sync_rows(csv_path: Path) -> Tuple[Dict[str, np.ndarray], Optiona
                 except ValueError:
                     return np.nan
 
-            cols["hypervisor_rx_to_tx_sec"].append(parse_optional("hypervisor_rx_to_tx_sec"))
-            cols["sitl_cmd_to_response_sitl_sec"].append(
-                parse_optional("sitl_cmd_to_response_sitl_sec")
-            )
-            cols["sitl_cmd_to_response_py_sec"].append(
-                parse_optional("sitl_cmd_to_response_py_sec")
+            cols["py_write_wall_sec"].append(parse_optional("py_write_wall_sec"))
+            cols["hypervisor_rx_to_tx_sec"].append(
+                parse_optional("hypervisor_rx_to_tx_sec")
             )
             if has_flight_mode:
                 modes.append((row.get("flight_mode") or "").strip())
@@ -67,139 +113,355 @@ def _load_step_sync_rows(csv_path: Path) -> Tuple[Dict[str, np.ndarray], Optiona
     return out, mode_list
 
 
-def _sitl_delay_metric_codes(
-    sitl_sitl: np.ndarray, sitl_py: np.ndarray
+def _load_sitl_trace_rows(path: Path) -> Tuple[List[dict], Optional[List[str]]]:
+    with path.open(newline="", encoding="utf-8", errors="replace") as f:
+        reader = csv.DictReader(f)
+        fields = list(reader.fieldnames or ())
+        rows = list(reader)
+    return rows, fields
+
+
+def _tx_events_in_trace(rows: List[dict]) -> List[str]:
+    names: set[str] = set()
+    for r in rows:
+        e = (r.get("event") or "").strip()
+        if e.startswith("TX_"):
+            names.add(e)
+    return sorted(names)
+
+
+def _sitl_pair_wall_mono(
+    rows: List[dict], tx_event: str
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    pair_idx, dsec = _deltas_rc_to_tx(rows, tx_event)
+    wall, _ = _deltas_rc_to_tx_wall(rows, tx_event)
+    mono_rel, _ = _deltas_rc_to_tx_mono_rel(rows, tx_event)
+    return pair_idx, dsec, wall, mono_rel
+
+
+def resolve_sitl_tx_for_plot(
+    rows: List[dict],
+    *,
+    requested: str,
+    trace_path: Path,
+) -> Tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Pick TX event column; returns (effective_event, pair_idx, deltas, wall_abs, mono_rel)."""
+    if requested == "AUTO":
+        for ev in _SITL_TX_AUTO_ORDER:
+            pj, d, w, m = _sitl_pair_wall_mono(rows, ev)
+            if d.size > 0:
+                print(f"SITL TX event (--sitl-tx AUTO → {ev})", file=sys.stderr)
+                return ev, pj, d, w, m
+        print(
+            f"No RC_RX→TX_* pairs (tried {', '.join(_SITL_TX_AUTO_ORDER)}) in {trace_path}",
+            file=sys.stderr,
+        )
+        tx_like = ", ".join(_tx_events_in_trace(rows)) or "(none)"
+        print(f"TX-like events in trace: {tx_like}", file=sys.stderr)
+        pj, d, w, m = _sitl_pair_wall_mono(rows, _SITL_TX_AUTO_ORDER[0])
+        return _SITL_TX_AUTO_ORDER[0], pj, d, w, m
+    pj, d, w, m = _sitl_pair_wall_mono(rows, requested)
+    if d.size == 0:
+        print(f"No RC_RX->{requested} pairs in {trace_path}", file=sys.stderr)
+        tx_like = ", ".join(_tx_events_in_trace(rows)) or "(none)"
+        print(
+            f"TX-like events present: {tx_like} — use --sitl-tx AUTO "
+            "or an event that follows RC_RX in this build.",
+            file=sys.stderr,
+        )
+    return requested, pj, d, w, m
+
+
+def _deltas_rc_to_tx(
+    rows: List[dict], tx_event: str
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Per CSV row: which column supplied the plotted SITL cmd->response delay.
+    """Pair index and Δt (mono_us) for legacy plot."""
+    idx_list: List[int] = []
+    dsec: List[float] = []
+    pending_mono: Optional[int] = None
+    n = 0
+    for r in rows:
+        ev = r.get("event", "").strip()
+        try:
+            mono = int(r["mono_us"])
+        except (KeyError, ValueError):
+            continue
+        if ev == "RC_RX":
+            pending_mono = mono
+            continue
+        if pending_mono is None:
+            continue
+        if ev == tx_event:
+            idx_list.append(n)
+            n += 1
+            dsec.append((mono - pending_mono) * 1e-6)
+            pending_mono = None
+    return np.array(idx_list, dtype=float), np.array(dsec, dtype=float)
 
-    Returns:
-        Tuple of (codes, sitl_plot) where codes[i] is 0 = sitl_cmd_to_response_sitl_sec,
-        1 = sitl_cmd_to_response_py_sec (fallback), -1 = no finite value.
-    """
-    sitl_plot = np.array(sitl_sitl, dtype=float)
-    fin_s = np.isfinite(sitl_plot)
-    fin_p = np.isfinite(sitl_py)
-    missing_sitl_clock = ~fin_s
-    sitl_plot[missing_sitl_clock] = sitl_py[missing_sitl_clock]
-    codes = np.full(sitl_plot.shape, -1, dtype=np.int8)
-    codes[fin_s] = 0
-    codes[~fin_s & fin_p] = 1
-    return codes, sitl_plot
+
+def _deltas_rc_to_tx_wall(
+    rows: List[dict], tx_event: str
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Host wall time (s, Unix) at TX row, Δt from mono_us."""
+    t_wall: List[float] = []
+    dsec: List[float] = []
+    pending_mono: Optional[int] = None
+    for r in rows:
+        ev = r.get("event", "").strip()
+        try:
+            mono = int(r["mono_us"])
+        except (KeyError, ValueError):
+            continue
+        if ev == "RC_RX":
+            pending_mono = mono
+            continue
+        if pending_mono is None:
+            continue
+        if ev == tx_event:
+            raw_hw = (r.get("host_wall_us") or "").strip()
+            if raw_hw:
+                try:
+                    t_wall.append(int(raw_hw) * 1e-6)
+                except ValueError:
+                    t_wall.append(np.nan)
+            else:
+                t_wall.append(np.nan)
+            dsec.append((mono - pending_mono) * 1e-6)
+            pending_mono = None
+    return np.array(t_wall, dtype=float), np.array(dsec, dtype=float)
 
 
-def _build_step_plot(
-    rows: Dict[str, np.ndarray],
-    title: str,
-    out_path: Path | None,
-    flight_modes: Optional[List[str]] = None,
+def _deltas_rc_to_tx_mono_rel(
+    rows: List[dict], tx_event: str
+) -> Tuple[np.ndarray, np.ndarray]:
+    """X = (mono_tx − global trace min mono) seconds; Y = Δt RC_RX→TX from mono_us."""
+    global_min: Optional[int] = None
+    for r in rows:
+        try:
+            m = int(r["mono_us"])
+            global_min = m if global_min is None else min(global_min, m)
+        except (KeyError, ValueError):
+            continue
+    if global_min is None:
+        return np.array([], dtype=float), np.array([], dtype=float)
+    x_rel: List[float] = []
+    dsec: List[float] = []
+    pending_mono: Optional[int] = None
+    for r in rows:
+        ev = r.get("event", "").strip()
+        try:
+            mono = int(r["mono_us"])
+        except (KeyError, ValueError):
+            continue
+        if ev == "RC_RX":
+            pending_mono = mono
+            continue
+        if pending_mono is None:
+            continue
+        if ev == tx_event:
+            x_rel.append((mono - global_min) * 1e-6)
+            dsec.append((mono - pending_mono) * 1e-6)
+            pending_mono = None
+    return np.array(x_rel, dtype=float), np.array(dsec, dtype=float)
+
+
+def _flight_mode_markers(
+    ax,
+    x: np.ndarray,
+    flight_modes: List[str],
+    y_series: List[np.ndarray],
 ) -> None:
-    """Plot step index vs delays; bottom strip shows which metric feeds SITL delay each step."""
+    parts: List[np.ndarray] = []
+    for y in y_series:
+        yy = y[np.isfinite(y)]
+        if yy.size:
+            parts.append(yy)
+    stacked = np.concatenate(parts) if parts else np.array([], dtype=float)
+    ymax = float(np.max(stacked)) if stacked.size > 0 else 0.1
+    if not np.isfinite(ymax) or ymax <= 0:
+        ymax = 0.1
+    y_label = ymax * 0.92
+    prev = ""
+    for i, mode in enumerate(flight_modes):
+        m = (mode or "").strip()
+        if not m or i >= len(x):
+            continue
+        if i == 0 or m != prev:
+            xv = float(x[i])
+            ax.axvline(xv, color="#666666", linestyle=":", linewidth=0.9, alpha=0.75)
+            ax.text(
+                xv,
+                y_label,
+                m,
+                rotation=90,
+                verticalalignment="top",
+                horizontalalignment="right",
+                fontsize=7,
+                color="#333333",
+                clip_on=True,
+            )
+            prev = m
+
+
+def _build_figure_legacy(
+    *,
+    step_rows: Optional[Dict[str, np.ndarray]],
+    flight_modes: Optional[List[str]],
+    sitl_pair_idx: Optional[np.ndarray],
+    sitl_deltas: Optional[np.ndarray],
+    sitl_trace_basename: Optional[str],
+    sitl_tx_label: str,
+    title: str,
+):
     import matplotlib.pyplot as plt
 
-    step_idx = rows["step_idx"]
-    hypervisor = rows["hypervisor_rx_to_tx_sec"]
-    sitl_sitl = rows["sitl_cmd_to_response_sitl_sec"]
-    sitl_py = rows["sitl_cmd_to_response_py_sec"]
-    codes, sitl_plot = _sitl_delay_metric_codes(sitl_sitl, sitl_py)
-    used_py_fallback = bool(np.any((codes == 1)))
-
-    if step_idx.size < 2:
-        raise ValueError("Not enough rows in step sync CSV (need at least 2).")
-
-    fig, (ax, ax_src) = plt.subplots(
-        2,
-        1,
-        figsize=(10, 7.2),
-        sharex=True,
-        gridspec_kw={"height_ratios": [3.4, 1.0], "hspace": 0.07},
+    has_step = step_rows is not None and step_rows["step_idx"].size >= 1
+    has_sitl = (
+        sitl_pair_idx is not None and sitl_deltas is not None and sitl_deltas.size > 0
     )
-    has_hyper = np.any(~np.isnan(hypervisor))
-    has_sitl = np.any(~np.isnan(sitl_plot))
-    if not has_hyper and not has_sitl:
-        raise ValueError("No delay values found in CSV.")
-    if has_hyper:
-        ax.plot(
-            step_idx,
-            hypervisor,
-            label="Hypervisor delay rx->tx (s)",
-            linewidth=1.4,
-        )
+    if not has_step and not has_sitl:
+        raise ValueError("No plottable data.")
+
+    n_axes = int(has_step) + int(has_sitl)
+    fig_h = 4.6 * n_axes + 0.8
+    fig, axes = plt.subplots(n_axes, 1, figsize=(10, fig_h), squeeze=False)
+    ax_list = axes.ravel().tolist()
+    ai = 0
+    if has_step:
+        ax = ax_list[ai]
+        ai += 1
+        step_idx = step_rows["step_idx"]
+        hyper = step_rows["hypervisor_rx_to_tx_sec"]
+        if np.any(np.isfinite(hyper)):
+            ax.plot(
+                step_idx,
+                hyper,
+                label="Hypervisor delay rx→tx (Python, s)",
+                linewidth=1.3,
+                color="#1f77b4",
+            )
+        else:
+            ax.text(
+                0.5,
+                0.5,
+                "No finite hypervisor_rx_to_tx_sec",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
+        ax.set_ylabel("Delay (s)")
+        ax.set_xlabel("step_idx")
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="best")
+        y_for_mode = [hyper] if np.any(np.isfinite(hyper)) else []
+        if flight_modes and len(flight_modes) == len(step_idx) and y_for_mode:
+            _flight_mode_markers(ax, step_idx, flight_modes, y_for_mode)
+
     if has_sitl:
-        sitl_label = "SITL delay cmd->response (combined)"
-        if used_py_fallback:
-            sitl_label += " — see lower strip for metric per step"
+        ax = ax_list[ai]
         ax.plot(
-            step_idx,
-            sitl_plot,
-            label=sitl_label,
-            linewidth=1.4,
+            sitl_pair_idx,
+            sitl_deltas,
+            ".-",
+            markersize=3,
+            alpha=0.85,
+            color="#d62728",
+            label=f"SITL Δt RC_RX→{sitl_tx_label} (s)",
+        )
+        ax.set_ylabel("Delay (s)")
+        ax.set_xlabel("Pair index")
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="best")
+        if sitl_trace_basename:
+            ax.set_title(os.path.basename(sitl_trace_basename), fontsize=9, color="#555555")
+
+    fig.suptitle(title + " (legacy axes)", fontsize=12)
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    return fig
+
+
+def _build_figure_wall(
+    *,
+    t0: float,
+    x_hyp_rel: Optional[np.ndarray],
+    y_hyp: Optional[np.ndarray],
+    x_sitl_rel: Optional[np.ndarray],
+    y_sitl: Optional[np.ndarray],
+    flight_modes: Optional[List[str]],
+    x_mode_abs: Optional[np.ndarray],
+    title: str,
+    sitl_tx_label: str,
+    sitl_trace_basename: Optional[str],
+    sitl_x_from_mono: bool = False,
+):
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(10, 5.2))
+    y_parts: List[np.ndarray] = []
+
+    if x_hyp_rel is not None and y_hyp is not None and y_hyp.size > 0:
+        ax.plot(
+            x_hyp_rel,
+            y_hyp,
+            label="Hypervisor rx→tx (Python, s)",
+            linewidth=1.2,
+            color="#1f77b4",
             alpha=0.9,
         )
-    ax.set_ylabel("Delay (s)")
-    ax.set_title(title)
-    ax.grid(True, alpha=0.3)
-    ax.legend(loc="best")
+        y_parts.append(y_hyp[np.isfinite(y_hyp)])
 
-    if has_sitl:
-        rgba_sitl = mcolors.to_rgba("#1f77b4", 0.42)
-        rgba_py = mcolors.to_rgba("#ff7f0e", 0.42)
-        w0 = codes == 0
-        w1 = codes == 1
-        if np.any(w0):
-            ax_src.fill_between(
-                step_idx, 0.0, 0.42, where=w0, facecolor=rgba_sitl, linewidth=0, interpolate=False
-            )
-        if np.any(w1):
-            ax_src.fill_between(
-                step_idx, 0.58, 1.0, where=w1, facecolor=rgba_py, linewidth=0, interpolate=False
-            )
-        ax_src.set_ylim(0.0, 1.0)
-        ax_src.set_yticks([0.21, 0.79])
-        ax_src.set_yticklabels(
-            ["sitl_cmd_to_response_sitl_sec", "sitl_cmd_to_response_py_sec"],
-            fontsize=8,
+    if x_sitl_rel is not None and y_sitl is not None and y_sitl.size > 0:
+        ax.plot(
+            x_sitl_rel,
+            y_sitl,
+            ".-",
+            markersize=3,
+            label=f"SITL RC_RX→{sitl_tx_label} (C++ trace, s)",
+            color="#d62728",
+            alpha=0.88,
         )
-        ax_src.set_ylabel("SITL delay\nmetric", fontsize=9)
-        ax_src.grid(True, axis="x", alpha=0.25)
-        ax_src.legend(
-            handles=[
-                Patch(facecolor=rgba_sitl, edgecolor="#1f55a0", linewidth=0.5, label="SITL clock (time_boot)"),
-                Patch(facecolor=rgba_py, edgecolor="#cc6600", linewidth=0.5, label="Python monotonic"),
-            ],
-            loc="upper left",
-            fontsize=7,
-            title="Value plotted for SITL delay",
-            title_fontsize=7,
+        y_parts.append(y_sitl[np.isfinite(y_sitl)])
+
+    if sitl_x_from_mono and x_hyp_rel is not None:
+        ax.set_xlabel(
+            "Python: py_write_wall_sec − t₀ (s); SITL: mono − trace_min (s) "
+            "(not wall-synced to Python)"
+        )
+    elif sitl_x_from_mono:
+        ax.set_xlabel(
+            "SITL mono time − trace min (s) — internal AP_HAL monotonic clock"
         )
     else:
-        ax_src.set_yticks([])
-        ax_src.set_ylabel("")
+        ax.set_xlabel("Host wall time − t₀ (s) — t₀ = earliest plotted wall sample")
+    ax.set_ylabel("Delay (s)")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="best")
+    if sitl_trace_basename:
+        ax.set_title(os.path.basename(sitl_trace_basename), fontsize=9, color="#555555")
 
-    ax_src.set_xlabel("CSV record index (step_idx)")
-
-    if flight_modes and len(flight_modes) == len(step_idx):
-        parts: List[np.ndarray] = []
-        if has_hyper:
-            parts.append(hypervisor[np.isfinite(hypervisor)])
-        if has_sitl:
-            parts.append(sitl_plot[np.isfinite(sitl_plot)])
-        stacked = np.concatenate(parts) if parts else np.array([], dtype=float)
-        ymax = float(np.max(stacked)) if stacked.size > 0 else 0.1
+    if (
+        flight_modes
+        and x_mode_abs is not None
+        and len(flight_modes) == len(x_mode_abs)
+        and y_parts
+    ):
+        stacked = np.concatenate(y_parts)
+        ymax = float(np.nanmax(stacked)) if stacked.size else 0.1
         if not np.isfinite(ymax) or ymax <= 0:
             ymax = 0.1
         y_label = ymax * 0.92
         prev = ""
         for i, mode in enumerate(flight_modes):
             m = (mode or "").strip()
-            if not m:
+            if not m or i >= len(x_mode_abs):
+                continue
+            w = x_mode_abs[i]
+            if not np.isfinite(w):
                 continue
             if i == 0 or m != prev:
-                x = float(step_idx[i])
-                for a in (ax, ax_src):
-                    a.axvline(x, color="#666666", linestyle=":", linewidth=0.9, alpha=0.75)
+                ax.axvline(w - t0, color="#666666", linestyle=":", linewidth=0.9, alpha=0.75)
                 ax.text(
-                    x,
+                    w - t0,
                     y_label,
                     m,
                     rotation=90,
@@ -211,78 +473,257 @@ def _build_step_plot(
                 )
                 prev = m
 
-    fig.tight_layout()
+    fig.suptitle(title, fontsize=12)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    return fig
 
-    if out_path is not None:
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(out_path, dpi=160, bbox_inches="tight")
-        print(f"Saved plot: {out_path}")
-    else:
-        plt.show()
-    plt.close(fig)
+
+def _default_out_path(
+    step_path: Optional[Path],
+    sitl_path: Optional[Path],
+    sitl_tx: str,
+    *,
+    wall_unified: bool,
+) -> Path:
+    time_sync_log_dir().mkdir(parents=True, exist_ok=True)
+    suf = "_wall_delays.png" if wall_unified else "_delays.png"
+    if step_path is not None and sitl_path is not None:
+        return time_sync_log_dir() / f"{step_path.stem}_and_{sitl_path.stem}{suf}"
+    if step_path is not None:
+        return time_sync_log_dir() / f"{step_path.stem}{suf}"
+    if sitl_path is not None:
+        return time_sync_log_dir() / f"{sitl_path.stem}_rc_to_{sitl_tx.lower()}{suf}"
+    return time_sync_log_dir() / "delay_plot.png"
 
 
 def main() -> None:
-    """CLI entrypoint for one-graph delay plotting."""
     parser = argparse.ArgumentParser(
-        description=(
-            "Plot one graph: step index (X) vs delays (Y) "
-            "for hypervisor and SITL."
-        )
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "csv_path",
-        type=Path,
-        help="Path to drone_<id>_time_sync_steps.csv",
-    )
-    parser.add_argument(
-        "--out",
+        "step_csv",
+        nargs="?",
         type=Path,
         default=None,
-        help=(
-            "Optional PNG output path. If omitted and GUI is available, show window. "
-            "If GUI unavailable, save next to CSV as <csv_name>_time_sync.png."
-        ),
+        help="drone_<id>_time_sync_steps.csv",
+    )
+    parser.add_argument("--sitl-trace", type=Path, default=None, help="sitl_rc_telem_*.csv")
+    parser.add_argument(
+        "--sitl-latest",
+        action="store_true",
+        help="Newest sitl_rc_telem_<instance>_*.csv",
+    )
+    parser.add_argument("--sitl-instance", type=int, default=0, metavar="N")
+    parser.add_argument(
+        "--sitl-tx",
+        choices=("AUTO", "TX_SIM_STATE", "TX_LOCAL_POS", "TX_ATTITUDE"),
+        default="AUTO",
+        help="SITL TX row for RC_RX→TX latency (AUTO prefers first with data)",
+    )
+    parser.add_argument("--out", type=Path, default=None)
+    parser.add_argument("--no-show", action="store_true")
+    parser.add_argument(
+        "--legacy-split",
+        action="store_true",
+        help="Two subplots (step_idx / pair index) instead of host wall time",
     )
     parser.add_argument(
         "--title",
         type=str,
-        default="Hypervisor/SITL delay by CSV record",
-        help="Plot title.",
+        default="Delays: hypervisor vs SITL (host wall time)",
+        help="Figure title (wall-unified mode)",
+    )
+    parser.add_argument(
+        "--title-legacy",
+        type=str,
+        default="Hypervisor vs SITL delays",
+        help="Figure title (legacy mode)",
     )
     args = parser.parse_args()
 
-    interactive_mode = args.out is None
-    if interactive_mode:
-        if os.environ.get("DISPLAY"):
-            try:
-                matplotlib.use("TkAgg")
-            except Exception:
-                matplotlib.use("Agg")
-        else:
-            matplotlib.use("Agg")
+    step_rows: Optional[Dict[str, np.ndarray]] = None
+    flight_modes: Optional[List[str]] = None
+    if args.step_csv is not None:
+        if not args.step_csv.is_file():
+            raise FileNotFoundError(f"Step CSV not found: {args.step_csv}")
+        with args.step_csv.open("r", encoding="utf-8", newline="") as f:
+            head = f.readline()
+        if "step_idx" not in head or "hypervisor_rx_to_tx_sec" not in head:
+            raise ValueError(f"Expected drone_*_time_sync_steps.csv: {args.step_csv}")
+        step_rows, flight_modes = _load_step_rows(args.step_csv)
+
+    sitl_path: Optional[Path] = None
+    if args.sitl_latest:
+        found = glob_latest_sitl_trace(args.sitl_instance)
+        if not found:
+            searched = ", ".join(str(d) for d in _trace_search_dirs())
+            raise FileNotFoundError(f"No sitl_rc_telem_{args.sitl_instance}_*.csv in {searched}")
+        sitl_path = found
+        print("Using SITL trace:", sitl_path, file=sys.stderr)
+    elif args.sitl_trace is not None:
+        sitl_path = args.sitl_trace.resolve()
+        if not sitl_path.is_file():
+            raise FileNotFoundError(f"SITL trace not found: {sitl_path}")
+
+    if args.step_csv is None and sitl_path is None:
+        raise SystemExit("Provide step CSV and/or --sitl-trace / --sitl-latest.")
+
+    sitl_rows: List[dict] = []
+    sitl_fields: Optional[List[str]] = None
+    sitl_pair_idx: Optional[np.ndarray] = None
+    sitl_deltas: Optional[np.ndarray] = None
+    sitl_wall_abs: Optional[np.ndarray] = None
+    sitl_mono_rel: Optional[np.ndarray] = None
+    sitl_tx_effective: str = args.sitl_tx
+    if sitl_path is not None:
+        sitl_rows, sitl_fields = _load_sitl_trace_rows(sitl_path)
+        sitl_tx_effective, sitl_pair_idx, sitl_deltas, sitl_wall_abs, sitl_mono_rel = resolve_sitl_tx_for_plot(
+            sitl_rows,
+            requested=args.sitl_tx,
+            trace_path=sitl_path,
+        )
+
+    if step_rows is None and (
+        sitl_deltas is None or (isinstance(sitl_deltas, np.ndarray) and sitl_deltas.size == 0)
+    ):
+        raise SystemExit("No plottable delay data.")
+
+    w_step = step_rows["py_write_wall_sec"] if step_rows is not None else None
+    h_step = step_rows["hypervisor_rx_to_tx_sec"] if step_rows is not None else None
+    step_plot_ok = bool(
+        w_step is not None
+        and h_step is not None
+        and np.any(np.isfinite(w_step) & np.isfinite(h_step))
+    )
+    sitl_wall_ok = bool(
+        sitl_wall_abs is not None
+        and sitl_deltas is not None
+        and sitl_deltas.size > 0
+        and np.any(np.isfinite(sitl_wall_abs) & np.isfinite(sitl_deltas))
+    )
+    sitl_mono_ok = bool(
+        sitl_mono_rel is not None
+        and sitl_deltas is not None
+        and sitl_deltas.size > 0
+        and np.any(np.isfinite(sitl_mono_rel) & np.isfinite(sitl_deltas))
+    )
+    sitl_plot_ok = sitl_wall_ok or sitl_mono_ok
+
+    if args.legacy_split:
+        use_wall = False
+    elif step_rows is not None and sitl_path is not None and sitl_deltas is not None and sitl_deltas.size > 0:
+        use_wall = step_plot_ok and sitl_plot_ok
+    elif step_rows is not None:
+        use_wall = step_plot_ok
+    elif sitl_path is not None and sitl_deltas is not None and sitl_deltas.size > 0:
+        use_wall = sitl_plot_ok
+    else:
+        use_wall = False
+
+    show_win = not args.no_show and bool(os.environ.get("DISPLAY"))
+    if show_win:
+        try:
+            matplotlib.use("TkAgg")
+        except Exception:
+            show_win = False
+            print("TkAgg unavailable; save only.", file=sys.stderr)
     else:
         matplotlib.use("Agg")
 
-    if not args.csv_path.is_file():
-        raise FileNotFoundError(f"CSV not found: {args.csv_path}")
-    with args.csv_path.open("r", encoding="utf-8", newline="") as f:
-        header = f.readline()
-    if "step_idx" not in header:
-        raise ValueError(
-            "Unsupported CSV format. Use drone_<id>_time_sync_steps.csv from experiment directory."
+    fig = None
+    wall_unified = False
+    if use_wall:
+        t_candidates: List[float] = []
+        if step_rows is not None and step_plot_ok:
+            w = step_rows["py_write_wall_sec"]
+            h = step_rows["hypervisor_rx_to_tx_sec"]
+            m = np.isfinite(w) & np.isfinite(h)
+            t_candidates.append(float(np.min(w[m])))
+        if sitl_wall_ok and sitl_wall_abs is not None and sitl_deltas is not None:
+            m_w = np.isfinite(sitl_wall_abs) & np.isfinite(sitl_deltas)
+            if np.any(m_w):
+                t_candidates.append(float(np.min(sitl_wall_abs[m_w])))
+
+        if not t_candidates:
+            if sitl_mono_ok:
+                t0 = 0.0
+            else:
+                use_wall = False
+        if use_wall:
+            wall_unified = True
+            if t_candidates:
+                t0 = min(t_candidates)
+            else:
+                t0 = 0.0
+            x_hyp_rel = y_hyp = None
+            if step_plot_ok and step_rows is not None:
+                w = step_rows["py_write_wall_sec"]
+                h = step_rows["hypervisor_rx_to_tx_sec"]
+                m = np.isfinite(w) & np.isfinite(h)
+                x_hyp_rel = w[m] - t0
+                y_hyp = h[m]
+            x_sitl_rel = y_sitl = None
+            sitl_x_from_mono = sitl_mono_ok and not sitl_wall_ok
+            if sitl_wall_ok and sitl_wall_abs is not None and sitl_deltas is not None:
+                m = np.isfinite(sitl_wall_abs) & np.isfinite(sitl_deltas)
+                x_sitl_rel = sitl_wall_abs[m] - t0
+                y_sitl = sitl_deltas[m]
+            elif sitl_mono_ok and sitl_mono_rel is not None and sitl_deltas is not None:
+                m = np.isfinite(sitl_mono_rel) & np.isfinite(sitl_deltas)
+                x_sitl_rel = sitl_mono_rel[m]
+                y_sitl = sitl_deltas[m]
+
+            if x_hyp_rel is None and x_sitl_rel is None:
+                wall_unified = False
+                use_wall = False
+            else:
+                fig = _build_figure_wall(
+                    t0=t0,
+                    x_hyp_rel=x_hyp_rel,
+                    y_hyp=y_hyp,
+                    x_sitl_rel=x_sitl_rel,
+                    y_sitl=y_sitl,
+                    flight_modes=flight_modes,
+                    x_mode_abs=step_rows["py_write_wall_sec"] if step_rows is not None else None,
+                    title=args.title,
+                    sitl_tx_label=sitl_tx_effective,
+                    sitl_trace_basename=str(sitl_path) if sitl_path else None,
+                    sitl_x_from_mono=sitl_x_from_mono,
+                )
+
+    if fig is None:
+        wall_unified = False
+        fig = _build_figure_legacy(
+            step_rows=step_rows,
+            flight_modes=flight_modes,
+            sitl_pair_idx=sitl_pair_idx
+            if sitl_deltas is not None and sitl_deltas.size
+            else None,
+            sitl_deltas=sitl_deltas if sitl_deltas is not None and sitl_deltas.size else None,
+            sitl_trace_basename=str(sitl_path) if sitl_path else None,
+            sitl_tx_label=sitl_tx_effective,
+            title=args.title_legacy,
         )
+
+    import matplotlib.pyplot as plt
 
     out_path = args.out
-    if interactive_mode and matplotlib.get_backend().lower() == "agg":
-        out_path = args.csv_path.with_name(f"{args.csv_path.stem}_time_sync.png")
-        print(
-            "Interactive backend unavailable (no DISPLAY/Tk); "
-            f"saved PNG instead: {out_path}"
+    if out_path is None:
+        out_path = _default_out_path(
+            args.step_csv,
+            sitl_path,
+            sitl_tx_effective if sitl_path else args.sitl_tx,
+            wall_unified=wall_unified,
         )
+    else:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    rows, flight_modes = _load_step_sync_rows(args.csv_path)
-    _build_step_plot(rows, args.title, out_path, flight_modes=flight_modes)
+    fig.savefig(out_path, dpi=160, bbox_inches="tight")
+    print(f"Saved plot: {out_path}")
+    if show_win:
+        plt.show()
+    plt.close(fig)
 
 
 if __name__ == "__main__":
